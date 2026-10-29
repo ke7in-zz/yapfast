@@ -266,8 +266,10 @@ Discord picks the first offered codec every viewer's client decodes (op 4's
 opens the selected encoder and starts it with a keyframe, dropping queued
 frames in the old codec. If AV1 or H265 fails to encode or reopen after a
 size/codec change, Yapfast withdraws that codec with op 14, marking it not to
-encode, and continues with the remaining offers. H264 remains available,
-with x264 if its hardware encoder fails. The
+encode, and continues with the remaining offers, even if the failure precedes
+Discord's initial codec choice. A late choice from the initial advertisement
+does not revive a withdrawn encoder; the next offer update renegotiates it.
+H264 remains available, with x264 if its hardware encoder fails. The
 [Discord protocol](https://docs.discord.food/topics/voice-connections#supported-codecs)
 documents AV1 negotiation, not a GPU-vendor restriction.
 

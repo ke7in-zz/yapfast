@@ -247,14 +247,14 @@ impl StreamSender {
         lock(&self.shared.link).clone()
     }
 
-    /// The codec Discord wants the frames in, once it said. It changes when
-    /// a viewer joins who can't decode it, or leaves; frames in another
-    /// codec are dropped.
+    /// The codec Discord wants, or the first remaining offer before it has
+    /// chosen. It changes when viewers join or leave, and immediately when
+    /// an encoder is withdrawn; queued frames in another codec are dropped.
     pub fn codec(&self) -> Option<Codec> {
-        let chosen = (*lock(&self.shared.chosen))?;
+        let chosen = *lock(&self.shared.chosen);
         let offers = lock(&self.shared.offers);
         // Withdrawn, while Discord hasn't chosen again yet.
-        Some(chosen)
+        chosen
             .filter(|chosen| offers.contains(chosen))
             .or(offers.first().copied())
     }
@@ -379,15 +379,6 @@ pub(crate) fn video_attributes(
     })
 }
 
-/// Which way the video goes.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Role {
-    Send,
-    Receive,
-}
-
-/// Connects to a stream's server: identifying with its RTC server and a
-/// screen, and offering the codecs `role` needs.
 /// Select protocol's codecs for a sender: Opus, then each of `offers` by
 /// priority, and `withdrawn` ones it can't encode any more. A sender
 /// decodes nothing of its own stream.
@@ -421,13 +412,8 @@ fn codecs(video: impl Iterator<Item = (Codec, bool, bool)>) -> Value {
     Value::Array(codecs)
 }
 
-async fn open(
-    server: &StreamServer,
-    user: u64,
-    channel: u64,
-    role: Role,
-    shared: &Shared,
-) -> Result<Connection> {
+/// Connects to a stream's RTC server with this exact codec advertisement.
+async fn open(server: &StreamServer, user: u64, channel: u64, codecs: Value) -> Result<Connection> {
     // Discord made a stream's DAVE group id just before its RTC server id,
     // in the one stream seen so far; Dave moves to the id the voice server
     // uses if this guess is wrong.
@@ -444,11 +430,6 @@ async fn open(
         streams: json!([{"type": "screen", "rid": rtp::STREAM_RID, "quality": 100}]),
         user,
         group,
-    };
-    // Yapfast encodes in what it offers, and decodes what it was given.
-    let codecs = match role {
-        Role::Send => send_codecs(&lock(&shared.offers), &[]),
-        Role::Receive => receive_codecs(&lock(&shared.offers)),
     };
     let streamer: Vec<u64> = stream::parse(&server.stream_key)
         .and_then(|(_, _, streamer)| streamer.parse().ok())
@@ -468,7 +449,10 @@ async fn send(
     mut frames: mpsc::Receiver<Frame>,
     mut sounds: mpsc::Receiver<Sound>,
 ) -> Result<()> {
-    let mut connection = open(server, user, channel, Role::Send, shared).await?;
+    // Validate the session description against the offer actually sent,
+    // even if an encoder fails while the handshake is in flight.
+    let offered = lock(&shared.offers).clone();
+    let mut connection = open(server, user, channel, send_codecs(&offered, &[])).await?;
     let (ssrc, video, rtx) = (connection.ssrc, connection.video, connection.rtx);
     let mut size = *lock(&shared.size);
     send_json(
@@ -486,7 +470,6 @@ async fn send(
     *lock(&shared.link) = Link::Connected;
 
     // Discord's choice, or the first offered while it hasn't said.
-    let offered = lock(&shared.offers).clone();
     let chosen = connection.codec.unwrap_or(offered[0]);
     if !offered.contains(&chosen) {
         bail!("Discord asked for {chosen:?} video, and Yapfast offered {offered:?}");
@@ -800,7 +783,8 @@ async fn receive_stream(
     ),
     mut stopped: oneshot::Receiver<()>,
 ) -> Result<()> {
-    let mut connection = open(server, user, channel, Role::Receive, shared).await?;
+    let codecs = receive_codecs(&lock(&shared.offers));
+    let mut connection = open(server, user, channel, codecs).await?;
     let mut streamer = Streamer {
         codec: connection.codec,
         ..Streamer::default()
@@ -1016,6 +1000,26 @@ async fn receive_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn withdrawn_encoder_stays_withdrawn_during_initial_selection() {
+        let shared = Shared::new((320, 180));
+        *lock(&shared.offers) = vec![Codec::Av1, Codec::H264];
+        let (frames, _) = mpsc::channel(1);
+        let (sounds, _) = mpsc::channel(1);
+        let sender = StreamSender {
+            frames,
+            sounds,
+            shared,
+        };
+
+        sender.withdraw(Codec::Av1);
+        assert_eq!(sender.codec(), Some(Codec::H264));
+        // Discord can still select AV1 from the offer sent before failure.
+        *lock(&sender.shared.chosen) = Some(Codec::Av1);
+        assert_eq!(sender.codec(), Some(Codec::H264));
+        assert!(sender.shared.offers_changed.load(Ordering::Relaxed));
+    }
 
     #[test]
     fn learns_the_streamers_video() {
