@@ -111,7 +111,8 @@ impl Decoder {
             // Not in DECODES, so Discord sends this viewer H264.
             #[cfg(not(hevcdec))]
             Codec::H265 => bail!("this build of Yapfast can't decode H265"),
-            Codec::Av1 => bail!("this build of Yapfast can't decode AV1"),
+            // Never offered, so Discord sends this viewer another codec.
+            Codec::Av1 => bail!("Yapfast can't decode AV1"),
         };
         if raw.is_null() {
             bail!("could not start the {codec:?} decoder");

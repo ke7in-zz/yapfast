@@ -58,9 +58,9 @@
 // Annex B file FAKE_DISCORD_CAMERA names, once they ask with op 15. Alice's camera
 // is decrypted and its frames counted; GET /_control/call-video lists what
 // each call connection sent and asked for.
-// A Go Live stream's video is decrypted; VP8/H264/H265 frames are counted,
-// and AV1's RTP aggregation and OBU framing are checked. GET /_control/video
-// lists what each stream received.
+// A Go Live stream's video is decrypted and its frames and keyframes
+// counted, and AV1's RTP aggregation and OBU framing are checked too. GET
+// /_control/video lists what each stream received.
 // /_control/voice-move moves Alice's call in the server to another voice
 // server, and GET /_control/voice-identifies lists the tokens voice
 // connections identified with. POST /_control/elsewhere has Alice join the
@@ -3823,14 +3823,14 @@ function receiveVideo(packet: Buffer) {
     } else {
       stream.av1MalformedPackets++;
     }
-  } else {
-    const size = stream.codec === "H264" ? h264Keyframe(payload)
-      : stream.codec === "H265" ? h265Keyframe(payload)
-      : vp8Keyframe(payload);
-    if (size) {
-      stream.keyframes++;
-      [stream.width, stream.height] = size;
-    }
+  }
+  const size = stream.codec === "H264" ? h264Keyframe(payload)
+    : stream.codec === "H265" ? h265Keyframe(payload)
+    : stream.codec === "AV1" ? av1Keyframe(payload)
+    : vp8Keyframe(payload);
+  if (size) {
+    stream.keyframes++;
+    [stream.width, stream.height] = size;
   }
   if (marker) stream.frames++;
 }
@@ -4028,6 +4028,62 @@ function h265SpsSize(nal: Buffer): [number, number] | undefined {
     height -= y * (golomb() + golomb());
   }
   return [width, height];
+}
+
+/** The size an AV1 keyframe's first packet gives: N set in its aggregation
+ * header, then the sequence header as its first OBU element, after its
+ * length unless it's the packet's only element (W of 1). */
+function av1Keyframe(payload: Buffer): [number, number] | undefined {
+  const header = payload[0]!;
+  if (!(header & 0x08) || header & 0x80) return undefined;
+  let at = 1;
+  if (((header >> 4) & 3) !== 1) while (payload[at++]! & 0x80);
+  const obu = payload[at]!;
+  if (((obu >> 3) & 0x0f) !== 1) return undefined;
+  return av1SequenceSize(payload.subarray(at + (obu & 0x04 ? 2 : 1)));
+}
+
+/** Reads the largest frame size from an AV1 sequence header (AV1 5.5),
+ * which an encoder sets to the stream's size. */
+function av1SequenceSize(bytes: Buffer): [number, number] | undefined {
+  let bit = 0;
+  const read = (count: number) => {
+    let value = 0;
+    for (let i = 0; i < count; i++, bit++) value = value * 2 + ((bytes[bit >> 3]! >> (7 - (bit & 7))) & 1);
+    return value;
+  };
+  read(3); // seq_profile
+  read(1); // still_picture
+  if (read(1)) {
+    read(5); // reduced_still_picture_header: seq_level_idx[0]
+  } else {
+    let decoderModel = false;
+    let bufferDelayLength = 0;
+    if (read(1)) { // timing_info_present_flag
+      read(32); read(32); // num_units_in_display_tick, time_scale
+      if (read(1)) { // equal_picture_interval: num_ticks_per_picture_minus_1 as uvlc
+        let zeros = 0;
+        while (!read(1) && zeros < 32) zeros++;
+        read(zeros);
+      }
+      decoderModel = read(1) === 1;
+      if (decoderModel) {
+        bufferDelayLength = read(5) + 1;
+        read(32); read(5); read(5);
+      }
+    }
+    const initialDisplayDelay = read(1) === 1;
+    const points = read(5) + 1;
+    for (let i = 0; i < points; i++) {
+      read(12); // operating_point_idc
+      if (read(5) > 7) read(1); // seq_level_idx, seq_tier
+      if (decoderModel && read(1)) read(2 * bufferDelayLength + 1);
+      if (initialDisplayDelay && read(1)) read(4);
+    }
+  }
+  const widthBits = read(4) + 1;
+  const heightBits = read(4) + 1;
+  return [read(widthBits) + 1, read(heightBits) + 1];
 }
 
 /** The size an H264 packet's sequence parameter set gives: whole, or first in a STAP-A. */

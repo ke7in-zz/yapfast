@@ -244,20 +244,34 @@ fn recording(codec: Codec) -> Vec<Vec<u8>> {
     let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testing/fixtures");
     match codec {
         // IVF: a header, then frames after 12-byte headers with their size.
-        Codec::Vp8 | Codec::Av1 => {
-            // AV1 fixture: eight synthetic testsrc2 frames encoded offline with libaom-av1.
-            let file_name = if codec == Codec::Av1 {
-                "stream-av1.ivf"
-            } else {
-                "stream-vp8.ivf"
-            };
-            let file = std::fs::read(fixtures.join(file_name)).unwrap();
+        Codec::Vp8 => {
+            let file = std::fs::read(fixtures.join("stream-vp8.ivf")).unwrap();
             let mut at = usize::from(u16::from_le_bytes([file[6], file[7]]));
             let mut frames = vec![];
             while at + 12 <= file.len() {
                 let size = u32::from_le_bytes(file[at..at + 4].try_into().unwrap()) as usize;
                 frames.push(file[at + 12..at + 12 + size].to_vec());
                 at += 12 + size;
+            }
+            frames
+        }
+        // OBUs, split into temporal units at their delimiters.
+        Codec::Av1 => {
+            let file = std::fs::read(fixtures.join("stream-av1.obu")).unwrap();
+            let mut frames: Vec<Vec<u8>> = vec![];
+            let mut at = 0;
+            while at < file.len() {
+                // Each OBU gives its size, which fits in one LEB128 byte or two.
+                let (size, used) = match file[at + 1] {
+                    low if low & 0x80 == 0 => (usize::from(low), 1),
+                    low => (usize::from(low & 0x7f) | usize::from(file[at + 2]) << 7, 2),
+                };
+                let end = at + 1 + used + size;
+                if file[at] >> 3 & 0x0f == 2 {
+                    frames.push(vec![]);
+                }
+                frames.last_mut().unwrap().extend_from_slice(&file[at..end]);
+                at = end;
             }
             frames
         }
@@ -324,17 +338,17 @@ fn watch_frames(
     frames
 }
 
-/// Offers H265 first, as a GPU encoder lets Yapfast: Discord chooses it,
-/// and when a viewer whose client decodes only H264 and VP8 starts
-/// watching, it switches the stream to H264 with op 14, and Yapfast asks
-/// for a keyframe to send in it.
-async fn streams_h265_until_a_viewer_cant_decode_it(
+/// Offers `gpu`, AV1 or H265, first, as a GPU encoder lets Yapfast:
+/// Discord chooses it, and when a viewer whose client decodes only H264 and
+/// VP8 starts watching, it switches the stream to H264 with op 14, and
+/// Yapfast asks for a keyframe to send in it.
+async fn streams_gpu_codec_until_a_viewer_cant_decode_it(
     discord: &Discord,
     server: &str,
     mine: &yapfast_discord::stream::StreamServer,
+    gpu: Codec,
 ) {
-    let sender =
-        StreamSender::start(mine.clone(), 320, 180, 30, vec![Codec::H265, SEND_CODEC]).unwrap();
+    let sender = StreamSender::start(mine.clone(), 320, 180, 30, vec![gpu, SEND_CODEC]).unwrap();
     let chosen = |codec| {
         let sender = &sender;
         timeout(WAIT, async move {
@@ -343,7 +357,7 @@ async fn streams_h265_until_a_viewer_cant_decode_it(
             }
         })
     };
-    chosen(Codec::H265).await.expect("Discord chose H265");
+    chosen(gpu).await.expect("Discord chose the GPU's codec");
     assert!(sender.take_keyframe_request());
     let send = |codec, from: usize| {
         for (index, data) in recording(codec).into_iter().take(3).enumerate() {
@@ -378,7 +392,7 @@ async fn streams_h265_until_a_viewer_cant_decode_it(
         .await
         .unwrap_or_else(|_| panic!("the fake didn't get {frames} frames"))
     };
-    send(Codec::H265, 0);
+    send(gpu, 0);
     let video = received(3).await;
     assert_eq!(
         (
@@ -388,12 +402,12 @@ async fn streams_h265_until_a_viewer_cant_decode_it(
             &video["height"]
         ),
         (
-            &serde_json::json!("H265"),
+            &serde_json::json!(gpu.name()),
             &serde_json::json!(1),
             &serde_json::json!(320),
             &serde_json::json!(180)
         ),
-        "the conformance window crops the coded 184 lines"
+        "H265's conformance window crops the coded 184 lines"
     );
 
     post_control(
@@ -403,8 +417,8 @@ async fn streams_h265_until_a_viewer_cant_decode_it(
     );
     chosen(Codec::H264).await.expect("Discord switched to H264");
     assert!(sender.take_keyframe_request(), "the new codec starts whole");
-    // Frames still in H265 are dropped rather than sent as H264.
-    send(Codec::H265, 3);
+    // Frames still in the GPU's codec are dropped rather than sent as H264.
+    send(gpu, 3);
     send(Codec::H264, 6);
     let video = received(6).await;
     assert_eq!(
@@ -420,7 +434,9 @@ async fn streams_h265_until_a_viewer_cant_decode_it(
         )
     );
     post_control(server, "/_control/stream-viewer?user=bob&stop", "");
-    chosen(Codec::H265).await.expect("back to H265 without him");
+    chosen(gpu)
+        .await
+        .expect("back to the GPU's codec without him");
 }
 
 async fn wait_for_stream_video(
@@ -2792,7 +2808,9 @@ async fn calls_and_goes_live() {
     assert!(sent.video_bytes > 1000, "{sent:?}");
     assert_eq!(sent.resent, 1);
     drop(sender);
-    streams_h265_until_a_viewer_cant_decode_it(&discord, server, &mine).await;
+    for codec in [Codec::Av1, Codec::H265] {
+        streams_gpu_codec_until_a_viewer_cant_decode_it(&discord, server, &mine, codec).await;
+    }
 
     streams_av1_with_viewer_fallback_and_encoder_withdrawal(&discord, server, &mine).await;
     discord.pause_stream(&mine.stream_key, true);

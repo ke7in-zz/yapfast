@@ -2,7 +2,8 @@
 //! inside libwebrtc, native/h264.c with x264 (vendor/x264-src), and
 //! native/hwenc.c with FFmpeg's hardware encoders (vendor/ffmpeg-src) where
 //! the GPU has one. Frames arrive as RGBA or I420 and leave as VP8 frames,
-//! H264/H265 Annex B access units, or AV1 low-overhead OBUs.
+//! H264 or H265 access units in Annex B form, or AV1 temporal units of OBUs
+//! that give their sizes.
 
 use std::ffi::{c_int, c_long, c_longlong, c_uchar, c_uint, c_ulong};
 
@@ -338,7 +339,7 @@ impl Encoder {
     /// Encodes three planes, each with its stride, into `out`: the encoded
     /// size and whether it's a keyframe, or None when the frame was skipped.
     /// When a hardware H264 encoder fails, x264 takes over from this frame,
-    /// with a keyframe; hardware-only codecs must be renegotiated.
+    /// with a keyframe; H265 and AV1 have nothing to take over.
     fn encode_planes(
         &mut self,
         planes: [(&[u8], u32); 3],
@@ -425,9 +426,10 @@ fn open_software(
             yapfast_h264_free,
             "x264".into(),
         ),
-        Codec::H265 | Codec::Av1 => {
-            bail!("{codec:?} encodes only on a GPU, and this one has no encoder for it")
-        }
+        Codec::H265 | Codec::Av1 => bail!(
+            "{} encodes only on a GPU, and this one has no encoder for it",
+            codec.name()
+        ),
     };
     if opened.0.is_null() {
         bail!("could not start the {codec:?} encoder");
@@ -466,7 +468,7 @@ fn open_hardware(codec: Codec, width: u32, height: u32, fps: u32, kbps: u32) -> 
         tracing::info!(?codec, tried = report, "no GPU encoder opened");
         return None;
     }
-    tracing::debug!(?codec, engine = report, "encoding on the GPU");
+    tracing::debug!(engine = report, ?codec, "encoding on the GPU");
     Some((
         raw,
         yapfast_hwenc_encode,
@@ -608,6 +610,30 @@ mod tests {
         assert!(idr(&types(&frames[2].1)), "the forced keyframe");
         let keys: Vec<bool> = frames.iter().map(|(key, _)| *key).collect();
         assert_eq!(keys[..3], [true, false, true]);
+    }
+
+    /// AV1 on the GPU, where it has an encoder for it: a sequence header
+    /// before the first frame and the forced keyframe, not the delta, and
+    /// OBUs that packetize whole.
+    #[test]
+    fn encodes_av1_on_the_gpu() {
+        if Encoder::new(Codec::Av1, 320, 180, 30, 500, Effort::Light, true).is_err() {
+            eprintln!("no GPU encoder for AV1 here");
+            return;
+        }
+        assert!(Encoder::new(Codec::Av1, 320, 180, 30, 500, Effort::Light, false).is_err());
+        let (frames, engine) = encode_four(Codec::Av1, Effort::Light, (320, 180), true);
+        eprintln!("encoded with {engine}");
+        let sequence = |data| {
+            yapfast_discord::rtp::obu_elements(data)
+                .expect("OBUs within the frame")
+                .first()
+                .is_some_and(|element| (element[0] >> 3) & 0x0f == 1)
+        };
+        let keys: Vec<bool> = frames.iter().map(|(key, _)| *key).collect();
+        assert_eq!(keys[..3], [true, false, true]);
+        assert!(sequence(&frames[0].1) && sequence(&frames[2].1));
+        assert!(!sequence(&frames[1].1), "a delta frame");
     }
 
     /// The GPU's encoder where this machine has one, x264 where it hasn't:

@@ -569,16 +569,6 @@ mod tests {
             })
             .expect("a key package")
     }
-    fn av1_element_length(bytes: &[u8]) -> Option<(usize, usize)> {
-        let mut value = 0usize;
-        for (index, &byte) in bytes.iter().take(10).enumerate() {
-            value |= usize::from(byte & 0x7f).checked_shl((index * 7) as u32)?;
-            if byte & 0x80 == 0 {
-                return Some((value, index + 1));
-            }
-        }
-        None
-    }
 
     /// A viewer guesses the wrong group, sends its key package, then learns
     /// the group from the server's proposals while the streamer, already in
@@ -658,52 +648,37 @@ mod tests {
         let mut packetizer = rtp::Packetizer::new(9, rtp::Codec::H264);
         let mut assembler = rtp::Assembler::new(rtp::Codec::H264);
         let whole = packetizer
-            .packets(&sealed, 0)
+            .packets(&sealed, 0, false)
             .iter()
             .find_map(|packet| assembler.push(&rtp::parse(packet).unwrap()).frame)
             .expect("the frame, reassembled");
         assert_eq!(dave.decrypt(streamer, whole.data), Some(frame));
-        // The same group sends AV1 after DAVE's AV1 OBU processor has removed
-        // the final obu_size field and appended its authenticated trailer.
-        let tile_payload: Vec<u8> = (0..3000u32).map(|index| index as u8).collect();
-        let av1 = [
-            &[0x12, 0x00][..],         // temporal delimiter: DAVE removes it
-            &[0x0a, 0x02, 0xaa, 0xbb], // sequence header
-            &[0x42, 0x01, 0xcc],       // tile list: DAVE removes it
-            &[0x32, 0xb8, 0x17],       // final frame OBU, obu_size = 3000
-            &tile_payload,
+
+        // AV1: a temporal delimiter, which DAVE and the packetizer drop, a
+        // sequence header and a frame OBU of 2500 bytes; DAVE leaves the
+        // last OBU without its size, before the trailer.
+        let tile: Vec<u8> = (0..2500u32).map(|index| (index % 251) as u8).collect();
+        let frame = [
+            &[0x12, 0][..],
+            &[1 << 3 | 2, 11],
+            &[7; 11],
+            &[6 << 3 | 2, 0xc4, 0x13],
+            &tile,
         ]
         .concat();
-        let sealed = dave.encrypt(rtp::Codec::Av1, &av1).unwrap();
-        assert!(sealed.ends_with(&[0xfa, 0xfa]));
+        let sealed = host
+            .encrypt(MediaType::VIDEO, Codec::AV1, &frame)
+            .unwrap()
+            .into_owned();
         let mut packetizer = rtp::Packetizer::new(9, rtp::Codec::Av1);
-        let packets = packetizer.packets(&sealed, 3000);
-        assert!(packets.len() >= 4, "the encrypted frame OBU is fragmented");
-
-        let mut whole = Vec::with_capacity(sealed.len());
-        let mut continues = false;
-        for (index, sent) in packets.iter().enumerate() {
-            let packet = rtp::parse(sent).unwrap();
-            assert_eq!(packet.payload_type, rtp::AV1);
-            assert_eq!(packet.marker, index + 1 == packets.len());
-            let (&aggregation, element) = packet.payload.split_first().unwrap();
-            assert_eq!(aggregation & 0x30, 0, "W=0 length-prefixed element");
-            assert_eq!(aggregation & 0x07, 0, "reserved bits are zero");
-            assert_eq!(aggregation & 0x80 != 0, continues, "Z follows prior Y");
-            let (length, prefix) = av1_element_length(element).unwrap();
-            assert_eq!(length, element.len() - prefix);
-            whole.extend_from_slice(&element[prefix..]);
-            continues = aggregation & 0x40 != 0;
-        }
-        assert!(!continues, "the final OBU fragment ends");
-        assert_eq!(whole, sealed, "packetization preserves DAVE bytes exactly");
-
-        let decrypted = host.decrypt(viewer, MediaType::VIDEO, &whole).unwrap();
-        assert_eq!(
-            decrypted,
-            [&[0x0a, 0x02, 0xaa, 0xbb, 0x30][..], &tile_payload,].concat(),
-            "DAVE restores the filtered OBU bytes without the trailer"
-        );
+        let mut assembler = rtp::Assembler::new(rtp::Codec::Av1);
+        let whole = packetizer
+            .packets(&sealed, 3000, true)
+            .iter()
+            .find_map(|packet| assembler.push(&rtp::parse(packet).unwrap()).frame)
+            .expect("the frame, reassembled");
+        let opened = dave.decrypt(streamer, whole.data).expect("decrypted");
+        assert_eq!(rtp::obu_elements(&opened), rtp::obu_elements(&frame));
     }
 
     /// Someone already in a call commits Yapfast's addition, and the voice
