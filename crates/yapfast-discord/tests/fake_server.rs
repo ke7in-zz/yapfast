@@ -255,7 +255,9 @@ fn recording(codec: Codec) -> Vec<Vec<u8>> {
             }
             frames
         }
-        // OBUs, split into temporal units at their delimiters.
+        // OBUs, split into temporal units at their delimiters, as Yapfast
+        // reassembles them: without the delimiter, each OBU giving its size
+        // but the last, as DAVE leaves it.
         Codec::Av1 => {
             let file = std::fs::read(fixtures.join("stream-av1.obu")).unwrap();
             let mut frames: Vec<Vec<u8>> = vec![];
@@ -274,6 +276,28 @@ fn recording(codec: Codec) -> Vec<Vec<u8>> {
                 at = end;
             }
             frames
+                .iter()
+                .map(|unit| {
+                    let elements = yapfast_discord::rtp::obu_elements(unit).unwrap();
+                    let mut frame = vec![];
+                    for (index, element) in elements.iter().enumerate() {
+                        if index + 1 == elements.len() {
+                            frame.extend_from_slice(element);
+                            break;
+                        }
+                        // libaom's OBUs have no extension byte, and sizes
+                        // up to 16383 take two LEB128 bytes at most.
+                        let size = element.len() - 1;
+                        frame.push(element[0] | 0x02);
+                        match size {
+                            ..128 => frame.push(size as u8),
+                            _ => frame.extend_from_slice(&[size as u8 | 0x80, (size >> 7) as u8]),
+                        }
+                        frame.extend_from_slice(&element[1..]);
+                    }
+                    frame
+                })
+                .collect()
         }
         // Annex B, split at access unit delimiters, which aren't sent; each
         // unit gets a four-byte start code.
@@ -2599,16 +2623,18 @@ async fn calls_and_goes_live() {
     assert!(!watched.session_id.is_empty() && !watched.endpoint.is_empty());
 
     // Bob's video arrives whole: the recording's frames, in order, from the
-    // first keyframe, in VP8, in H264, and in H265 to a viewer that decodes
-    // it, while one that doesn't gets H264, though the fake loses one packet
-    // on the way and delivers another late each time.
+    // first keyframe, in VP8, in H264, and in H265 or AV1 to a viewer that
+    // decodes it, while one that doesn't gets H264, though the fake loses
+    // one packet on the way and delivers another late each time.
     let older = vec![Codec::H264, Codec::Vp8];
-    let all = vec![Codec::H265, Codec::H264, Codec::Vp8];
+    let all = vec![Codec::Av1, Codec::H265, Codec::H264, Codec::Vp8];
     for (codec, name, decodes) in [
         (Codec::Vp8, "vp8", older.clone()),
         (Codec::H264, "h264", older.clone()),
-        (Codec::H265, "h265", all),
-        (Codec::H264, "h265", older),
+        (Codec::H265, "h265", all.clone()),
+        (Codec::H264, "h265", older.clone()),
+        (Codec::Av1, "av1", all),
+        (Codec::H264, "av1", older),
     ] {
         stream_codec(server, name);
         let watched = watched.clone();
@@ -2629,7 +2655,7 @@ async fn calls_and_goes_live() {
     let repairs = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["repairs"].clone();
     assert_eq!(
         (repairs["dropped"].as_u64(), repairs["reordered"].as_u64()),
-        (Some(4), Some(4))
+        (Some(6), Some(6))
     );
     assert!(
         repairs["nacks"].as_u64() >= Some(2) && repairs["resent"].as_u64() >= Some(2),

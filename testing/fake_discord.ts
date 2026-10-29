@@ -77,7 +77,8 @@
 // and back when he stops. Watching
 // Bob's stream gets testing/fixtures' recording once the viewer asks for video
 // with op 15: VP8 or, after POST /_control/stream-codec with "h264", H264;
-// with "h265", H265 to viewers that decode it, and H264 to the rest.
+// with "h265" or "av1", that codec to viewers that decode it, and H264 to
+// the rest.
 // Alice has a DM with Bob, whose last two messages she hasn't read, and a
 // group DM, "Weekend plans", with Bob and Carol. POST /_control/dm makes Dave
 // write to her, opening a DM with her the first time, and POST
@@ -3260,6 +3261,34 @@ function annexB(file: Buffer, hevc = false): { units: Buffer[]; keyframe: boolea
   return frames.filter((frame) => frame.units.length > 0);
 }
 
+/** An AV1 recording's temporal units as OBU elements, each OBU without
+ *  its size field, temporal delimiters left out; a unit with a sequence
+ *  header (type 1) is a keyframe. */
+function obus(file: Buffer): { elements: Buffer[]; keyframe: boolean }[] {
+  const frames: { elements: Buffer[]; keyframe: boolean }[] = [];
+  for (let at = 0; at < file.length; ) {
+    const header = file[at]!;
+    const extension = header & 0x04 ? 1 : 0;
+    let size = 0;
+    let read = at + 1 + extension;
+    for (let shift = 0; ; shift += 7) {
+      const byte = file[read++]!;
+      size += (byte & 0x7f) * 2 ** shift;
+      if (!(byte & 0x80)) break;
+    }
+    const type = (header >> 3) & 0x0f;
+    if (type === 2 || frames.length === 0) frames.push({ elements: [], keyframe: false });
+    if (type !== 2) {
+      const headers = Buffer.from(file.subarray(at, at + 1 + extension));
+      headers[0] = header & ~0x02;
+      frames.at(-1)!.elements.push(Buffer.concat([headers, file.subarray(read, read + size)]));
+      if (type === 1) frames.at(-1)!.keyframe = true;
+    }
+    at = read + size;
+  }
+  return frames.filter((frame) => frame.elements.length > 0);
+}
+
 const voiceTone = oggPackets(readFileSync(new URL("voice-tone.ogg", fixtures)));
 
 // --- Soundboard ---------------------------------------------------------------
@@ -3496,7 +3525,9 @@ const recordings = {
 };
 /** Bob's recording in H265, for viewers that decode it; an env's video has none. */
 const h265Recording = annexB(readFileSync(new URL("stream-h265.h265", fixtures)), true);
-let streamCodec: "vp8" | "h264" | "h265" = "vp8";
+/** And in AV1, for viewers that decode that. */
+const av1Recording = obus(readFileSync(new URL("stream-av1.obu", fixtures)));
+let streamCodec: "vp8" | "h264" | "h265" | "av1" = "vp8";
 
 /** A viewer of Bob's stream and what it was sent. */
 type Watcher = {
@@ -3600,6 +3631,19 @@ function streamTo(ws: Socket, key: Buffer, ssrc: number, watcher = watchers.get(
         send(Buffer.concat([descriptor, data.subarray(at, at + 1100)]), at + 1100 >= data.length, timestamp, 105);
       }
       picture = (picture + 1) & 0x7fff;
+    } else if (watcher.codec === "av1") {
+      // AOM's RTP payload format, an OBU element to a packet, or a large
+      // one in fragments: W of 1, Z and Y marking fragments, and N on a
+      // keyframe's first packet, which starts with its sequence header.
+      const { elements, keyframe } = av1Recording[frame % av1Recording.length]!;
+      elements.forEach((element, index) => {
+        const last = index === elements.length - 1;
+        for (let at = 0; at < element.length; at += 1100) {
+          const end = at + 1100 >= element.length;
+          const header = 0x10 | (at > 0 ? 0x80 : 0) | (end ? 0 : 0x40) | (keyframe && index === 0 && at === 0 ? 0x08 : 0);
+          send(Buffer.concat([Buffer.from([header]), element.subarray(at, at + 1100)]), last && end, timestamp, 107);
+        }
+      });
     } else if (watcher.codec === "h265") {
       // RFC 7798: whole NAL units, or fragmentation units (type 49) with
       // the unit's type in their header.
@@ -4274,11 +4318,11 @@ function voiceMessage(ws: Socket, text: string) {
         callAudio.set(ws.data.ssrc, { token: ws.data.voiceToken ?? "", packets: 0, undecryptable: 0, silent: 0, voiced: 0, speaking: [], resumed: 0, lost: 0, rtcpCounter: 1 << 20 });
       }
       const watching = ws.data.stream && !ws.data.stream.endsWith(`:${ALICE}`);
-      // Discord sends a viewer H265 only when its client decodes it, and
-      // H264 instead, as it chooses for every viewer of a stream.
-      const decodesH265 = ((d.codecs ?? []) as { name: string; decode?: boolean }[])
-        .some((codec) => codec.name === "H265" && codec.decode !== false);
-      const watched = streamCodec === "h265" && !decodesH265 ? "h264" : streamCodec;
+      // Discord sends a viewer H265 or AV1 only when its client decodes
+      // it, and H264 instead, as it chooses for every viewer of a stream.
+      const decodesIt = ((d.codecs ?? []) as { name: string; decode?: boolean }[])
+        .some((codec) => codec.name.toLowerCase() === streamCodec && codec.decode !== false);
+      const watched = (streamCodec === "h265" || streamCodec === "av1") && !decodesIt ? "h264" : streamCodec;
       const codec = watching ? watched : (offered?.name ?? "VP8").toLowerCase();
       reply(4, { mode: d.data?.mode, secret_key: [...key], dave_protocol_version: 0, audio_codec: "opus", video_codec: codec.toUpperCase() });
       if (watching && ws.data.ssrc) {
@@ -7703,7 +7747,7 @@ const server = Bun.serve<SocketData>({
     }
     if (req.method === "POST" && path === "/_control/stream-codec") {
       const codec = (await req.text()).trim();
-      if (codec !== "vp8" && codec !== "h264" && codec !== "h265") return new Response("vp8, h264 or h265\n", { status: 400 });
+      if (codec !== "vp8" && codec !== "h264" && codec !== "h265" && codec !== "av1") return new Response("vp8, h264, h265 or av1\n", { status: 400 });
       streamCodec = codec;
       return new Response(`streams are ${codec}\n`);
     }

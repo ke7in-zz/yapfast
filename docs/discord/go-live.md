@@ -157,15 +157,14 @@ too, except those carrying keys.
 
 Watching works the same way in reverse. Clicking someone's LIVE badge, or their
 tile in the call, sends op 20 and starts a worker with a watch job. The worker
-connects as a viewer, offers H265, H264 and VP8 for decoding only (H265 only
-where it's built, on Linux and Windows; never AV1, which Yapfast doesn't
-decode, so Discord switches an AV1 stream to another codec for it), and asks
-for video with op 15. It
+connects as a viewer, offers AV1, H265, H264 and VP8 for decoding only (H265
+only where it's built, on Linux and Windows), and asks for video with op 15. It
 learns the streamer's SSRCs and codec from op 12 and op 14, then puts RTP
 packets back in order (`rtp::Reorder`) and together into frames
 (`rtp::Assembler`: VP8 descriptors, H264 single units, STAP-A and FU-A, and
 H265 single units, aggregation and fragmentation units, as Annex B; AV1's
-OBU elements as OBUs, the last without its size). As
+OBU elements as OBUs, the last without its size, as DAVE's decryptor needs
+it and dav1d takes it). As
 Discord's client does, it asks for a missing packet again at once with a
 generic NACK, again every 80 ms up to three times, and takes the resend from
 the streamer's RTX SSRC (RFC 4588); padding there, which probes the path, is
@@ -178,9 +177,12 @@ indication, at most every 500 ms. It sends a receiver report every second
 echoed). With `YAPFAST_LOG=debug` it logs what it received every 5 s (`stream
 received`): packets out of order, resent, recovered, given up on, and keyframes
 asked for. The worker decodes with libvpx or with the FFmpeg H264 decoder in
-libwebrtc's archive (`native/decode.c`), or H265 with the HEVC decoder of
-`vendor/ffmpeg-src`'s FFmpeg (`native/hevc.c`), which libwebrtc's lacks, and
-writes RGBA at up to 1080p into the shared frames. That FFmpeg is built with
+libwebrtc's archive (`native/decode.c`), AV1 with the dav1d in the same
+archive (`native/av1.c`), a picture out for each frame in, or H265 with the
+HEVC decoder of `vendor/ffmpeg-src`'s FFmpeg (`native/hevc.c`), which
+libwebrtc's lacks, and writes RGBA at up to 1080p into the shared frames.
+dav1d takes 0.07 of a core for 1080p30 AV1 at 3.6 Mbit/s, against 0.1 for
+H265 at the same bitrate. That FFmpeg is built with
 its x86-64 assembly, without which H265 took over three times the processor
 time. Watching is possible only in the call you're in, so clicking someone
 sharing in another channel joins it first, once asked, and watches once the
@@ -273,8 +275,8 @@ dropping frames still in the old codec. When AV1 or H265 fails mid-stream,
 or doesn't open again for a new size or after a switch, Yapfast withdraws
 it with its own op 14 `codecs`, marking it not to encode, and goes on in the
 next codec offered, H264 last. Another Yapfast watching keeps the stream in
-H265, and moves an AV1 stream to H265 or H264. Which of Discord's own
-clients decode H265 and AV1 isn't checked yet.
+AV1 or H265. Which of Discord's own clients decode H265 and AV1 isn't
+checked yet.
 
 AV1 encodes on NVIDIA's RTX 40 series and newer (`av1_nvenc`), on AMD's
 RX 7000 series and newer and the Radeon 700M graphics, through AMF on
