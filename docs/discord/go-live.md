@@ -60,15 +60,21 @@ there (`yapfast_discord::stream_connection`). The connection is a call's
 heartbeats acknowledge the last sequence number, and binary DAVE messages start
 with one. It identifies with the stream's RTC server and `video: true`,
 discovers its address, then uses `aead_aes256_gcm_rtpsize` transport
-encryption. Yapfast offers H264, and H265 before it when the GPU encodes H265
+encryption. Yapfast offers AV1, H265 and H264 in that order, leaving out
+hardware-only codecs whose encoders cannot open
 ([Encoding on the GPU](#encoding-on-the-gpu)), and announces its size with op
-12, again whenever someone connects. Frames come from x264 (`vendor/x264-src`,
+12, again whenever someone connects. H264 frames come from x264 (`vendor/x264-src`,
 built from source) through `native/h264.c`, with a keyframe at least every 3 s
 and whenever RTCP asks for one; [Choosing the H264
 encoder](#choosing-the-h264-encoder) says how it's set up and why. Yapfast also
 has VP8 (`native/vp8.c`, still built and tested); every Go Live sender known to
 work sends H264. H264 goes as whole NAL units or FU-A fragments, H265 as whole
-units or FU fragments (RFC 7798), and past a frame's first 8 packets, 4 go out
+units or FU fragments (RFC 7798), and AV1 as length-prefixed OBUs with
+aggregation and fragmentation in the
+[AOM RTP format](https://aomediacodec.github.io/av1-rtp-spec/v1.0.0.html).
+AV1 temporal delimiters and tile lists are omitted; OBU size fields are
+retained, including DAVE's final size-less OBU and authenticated trailer.
+Past a frame's first 8 packets, 4 go out
 each millisecond: a 1080p keyframe of 200 sent at once can overflow buffers on
 the way. Yapfast keeps the last 2048 video packets, and when a viewer reports
 some lost with a generic NACK (RTCP 205), resends up to 128 of them as
@@ -211,10 +217,12 @@ a stream's H264 goes to the graphics card's encoder where it has one:
 It's on by default because it takes almost no processor time and looks better
 than x264 at low bitrates. Intel graphics encode with x264 on Windows so far.
 The setting lives in `layout.json` and reaches the worker with each
-`Job::Share`; the camera stays on x264. When the GPU's encoder fails during a
-stream, x264 takes over from that frame with a keyframe. The worker logs which
-encoder each stream got ("encoding the stream", `engine`), and when none
-opened, why each GPU encoder failed ("no GPU encoder opened").
+`Job::Share`; the camera stays on x264. When the GPU's H264 encoder fails
+during a stream, x264 takes over from that frame with a keyframe.
+The worker logs each opened encoder ("opened a stream encoder"), the initial
+active codec and `engine` ("encoding the stream"), and why GPU encoders fail
+to open ("no GPU encoder opened", `codec` and `tried`). The stream's existing
+sending statistics report its current codec and encoder, including fallback.
 
 FFmpeg is built from `vendor/ffmpeg-src` into the one binary, with only its
 hardware encoders and every symbol prefixed so it can't meet the FFmpeg
@@ -245,13 +253,37 @@ insert, with a patch to FFmpeg for each (AMF's sets the target, peak and buffer
 on the running encoder). "Higher quality" changes nothing on the GPU: NVENC's
 slowest preset looked no better than p4.
 
-Where the GPU's encoder encodes H265, the stream offers it too, first, since it
-looks better than H264 at the same bitrate. Discord picks the codec Yapfast
-offers first that every viewer's client decodes (op 4's `video_codec`), and
-when someone who can't decode it starts watching, switches the stream with op
-14; Yapfast then opens the other encoder and starts it with a keyframe,
-dropping frames still in the old codec. When H265 fails mid-stream, Yapfast
-withdraws it with its own op 14 `codecs`, marking it not to encode, and goes on
-in H264. Another Yapfast watching keeps the stream in H265. Which of Discord's
-own clients decode H265 isn't checked yet. AMF hasn't run on AMD hardware yet:
-Wine has no AMF runtime, so there it fails to open and x264 encodes.
+The stream probes AV1 and H265 at the captured size before offering them.
+AV1 uses `av1_amf` on AMD Windows drivers and `av1_vaapi` with the radeonsi
+driver on AMD Linux; the same hardware shim also tries `av1_nvenc`.
+An installed encoder name is not enough: the GPU must support AV1 encoding,
+the driver/runtime must support it, and the encoder must open. There is no
+software AV1 encoder in this path. With GPU encoding disabled, only H264 is
+offered.
+
+Discord picks the first offered codec every viewer's client decodes (op 4's
+`video_codec`), and changes it with op 14 when viewers join or leave. Yapfast
+opens the selected encoder and starts it with a keyframe, dropping queued
+frames in the old codec. If AV1 or H265 fails to encode or reopen after a
+size/codec change, Yapfast withdraws that codec with op 14, marking it not to
+encode, and continues with the remaining offers. H264 remains available,
+with x264 if its hardware encoder fails. The
+[Discord protocol](https://docs.discord.food/topics/voice-connections#supported-codecs)
+documents AV1 negotiation, not a GPU-vendor restriction.
+
+AV1 is outgoing Go Live only: Yapfast does not advertise AV1 decoding, and
+another Yapfast viewer therefore selects H265 or H264. Camera calls are
+unchanged. Compatibility with individual Discord receiving clients still
+needs real-stream validation; fake Discord checks negotiation, RTP framing,
+retransmission and fallback, not Discord playback or DAVE interoperability.
+
+AMD VCN4/RX 7000 AV1 hardware can pad unaligned pictures: AMF's unrestricted
+alignment mode can code 320x180 as 320x192, and 1920x1080 as 1920x1082.
+RTP carries no container cropping metadata, so receiving clients may show
+the padded edge. Sizes such as 1280x720 are aligned. See AMD's
+[alignment documentation](https://github.com/GPUOpen-LibrariesAndSDKs/AMF/wiki/AV1-Encoder#av1-specific-api)
+and [hardware limitation](https://github.com/GPUOpen-LibrariesAndSDKs/AMF/issues/423).
+The stream's size diagnostics describe the input picture, not hardware padding.
+Windows AMF synthetic encoding has been exercised; native AMD Linux VA-API
+and end-to-end Discord viewer playback remain unverified. Wine has no AMF
+runtime, so there it fails to open and x264 encodes.

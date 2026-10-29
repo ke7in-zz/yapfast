@@ -1,6 +1,6 @@
-//! RTP for Go Live video: packetizing and reassembling VP8 (RFC 7741) and
-//! H264 (RFC 6184) frames, Discord's "rtpsize" transport encryption, and the
-//! RTCP that goes with them.
+//! RTP for Go Live video: packetizing and reassembling VP8 (RFC 7741), H264
+//! (RFC 6184), H265 (RFC 7798), and outgoing AV1 (AOM RTP v1.0), Discord's
+//! "rtpsize" transport encryption, and the RTCP that goes with them.
 
 use aes_gcm::{Aes256Gcm, KeyInit, aead::AeadInPlace};
 use anyhow::{Result, anyhow, bail};
@@ -14,13 +14,17 @@ pub const VP8: u8 = 105;
 pub const VP8_RTX: u8 = 106;
 pub const H265: u8 = 103;
 pub const H265_RTX: u8 = 104;
+pub const AV1: u8 = 107;
+pub const AV1_RTX: u8 = 108;
 
-/// The video codecs Yapfast can receive.
+/// Video codecs present on Discord's RTP payloads. AV1 is packetized for
+/// sending, but its viewer-side decoder remains unsupported.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Codec {
     Vp8,
     H264,
     H265,
+    Av1,
 }
 
 impl Codec {
@@ -29,6 +33,7 @@ impl Codec {
             VP8 => Some(Self::Vp8),
             H264 => Some(Self::H264),
             H265 => Some(Self::H265),
+            AV1 => Some(Self::Av1),
             _ => None,
         }
     }
@@ -39,6 +44,7 @@ impl Codec {
             "VP8" => Some(Self::Vp8),
             "H264" => Some(Self::H264),
             "H265" => Some(Self::H265),
+            "AV1" => Some(Self::Av1),
             _ => None,
         }
     }
@@ -48,6 +54,7 @@ impl Codec {
             Self::Vp8 => "VP8",
             Self::H264 => "H264",
             Self::H265 => "H265",
+            Self::Av1 => "AV1",
         }
     }
 
@@ -57,6 +64,7 @@ impl Codec {
             Self::Vp8 => (VP8, VP8_RTX),
             Self::H264 => (H264, H264_RTX),
             Self::H265 => (H265, H265_RTX),
+            Self::Av1 => (AV1, AV1_RTX),
         }
     }
 }
@@ -132,6 +140,7 @@ impl Packetizer {
             Codec::Vp8 => self.vp8_payloads(frame),
             Codec::H264 => h264_payloads(frame),
             Codec::H265 => h265_payloads(frame),
+            Codec::Av1 => av1_payloads(frame),
         };
         let count = payloads.len();
         let payload_type = self.codec.payload_types().0;
@@ -295,6 +304,173 @@ fn h265_payloads(frame: &[u8]) -> Vec<Vec<u8>> {
     }
     payloads
 }
+/// A low-overhead OBU. A final OBU without an obu_size field extends to the
+/// end, including any DAVE trailer.
+#[derive(Clone, Copy)]
+struct Av1Obu<'a> {
+    bytes: &'a [u8],
+    kind: u8,
+    layer: Option<u8>,
+}
+
+/// Reads the size LEB128 used by AV1 without allowing overlong shifts or
+/// values that cannot fit in this process.
+fn av1_read_leb128(bytes: &[u8]) -> Option<(usize, usize)> {
+    let mut value = 0u64;
+    for (index, &byte) in bytes.iter().take(10).enumerate() {
+        let low = u64::from(byte & 0x7f);
+        if index == 9 && low > 1 {
+            return None;
+        }
+        value |= low << (index * 7);
+        if byte & 0x80 == 0 {
+            return Some((usize::try_from(value).ok()?, index + 1));
+        }
+    }
+    None
+}
+
+fn av1_leb128_len(mut value: usize) -> usize {
+    let mut len = 1;
+    while value >= 0x80 {
+        value >>= 7;
+        len += 1;
+    }
+    len
+}
+
+fn av1_write_leb128(mut value: usize, out: &mut Vec<u8>) {
+    while value >= 0x80 {
+        out.push((value as u8 & 0x7f) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+fn av1_obu_at(frame: &[u8], at: usize) -> Option<(Av1Obu<'_>, usize)> {
+    const HAS_EXTENSION: u8 = 0x04;
+    const HAS_SIZE: u8 = 0x02;
+
+    let header = *frame.get(at)?;
+    if header & 0x81 != 0 {
+        return None;
+    }
+    let kind = (header >> 3) & 0x0f;
+    let mut body = at.checked_add(1)?;
+    let layer = if header & HAS_EXTENSION != 0 {
+        let extension = *frame.get(body)?;
+        if extension & 0x07 != 0 {
+            return None;
+        }
+        body = body.checked_add(1)?;
+        Some(extension & 0xf8)
+    } else {
+        None
+    };
+    let end = if header & HAS_SIZE != 0 {
+        let (size, leb_len) = av1_read_leb128(frame.get(body..)?)?;
+        body = body.checked_add(leb_len)?;
+        let end = body.checked_add(size)?;
+        if end > frame.len() {
+            return None;
+        }
+        end
+    } else {
+        frame.len()
+    };
+    Some((
+        Av1Obu {
+            bytes: frame.get(at..end)?,
+            kind,
+            layer,
+        },
+        end,
+    ))
+}
+
+fn flush_av1_payload(payloads: &mut Vec<Vec<u8>>, current: &mut Vec<u8>, layer: &mut Option<u8>) {
+    if current.len() > 1 {
+        payloads.push(std::mem::take(current));
+    }
+    *layer = None;
+}
+
+/// AOM AV1 RTP v1.0 payloads use W=0 here, so every OBU element has a leb128
+/// length. Compatible small OBUs share packets; large OBUs are fragmented
+/// with Z/Y, while N marks the packet starting a coded video sequence.
+fn av1_payloads(frame: &[u8]) -> Vec<Vec<u8>> {
+    const MAX_FRAGMENT: usize = CHUNK - 3;
+
+    if frame.is_empty() || frame.len() > MAX_FRAME {
+        return Vec::new();
+    }
+    let mut payloads = Vec::with_capacity(frame.len() / CHUNK + 1);
+    let mut current = Vec::new();
+    let mut current_layer = None;
+    let mut at = 0;
+    while at < frame.len() {
+        let Some((obu, end)) = av1_obu_at(frame, at) else {
+            return Vec::new();
+        };
+        at = end;
+        if matches!(obu.kind, 2 | 8) {
+            continue;
+        }
+        let starts_sequence = obu.kind == 1;
+        if starts_sequence && !current.is_empty() {
+            flush_av1_payload(&mut payloads, &mut current, &mut current_layer);
+        }
+        let element_prefix = av1_leb128_len(obu.bytes.len());
+        if 1 + element_prefix + obu.bytes.len() > CHUNK {
+            flush_av1_payload(&mut payloads, &mut current, &mut current_layer);
+            let mut fragment_at = 0;
+            while fragment_at < obu.bytes.len() {
+                let fragment_end = (fragment_at + MAX_FRAGMENT).min(obu.bytes.len());
+                let first = fragment_at == 0;
+                let last = fragment_end == obu.bytes.len();
+                let fragment = &obu.bytes[fragment_at..fragment_end];
+                let mut aggregation = 0;
+                if !first {
+                    aggregation |= 0x80;
+                }
+                if !last {
+                    aggregation |= 0x40;
+                }
+                if first && starts_sequence {
+                    aggregation |= 0x08;
+                }
+                let mut payload =
+                    Vec::with_capacity(1 + av1_leb128_len(fragment.len()) + fragment.len());
+                payload.push(aggregation);
+                av1_write_leb128(fragment.len(), &mut payload);
+                payload.extend_from_slice(fragment);
+                payloads.push(payload);
+                fragment_at = fragment_end;
+            }
+            continue;
+        }
+        if current_layer
+            .zip(obu.layer)
+            .is_some_and(|(current, incoming)| current != incoming)
+        {
+            flush_av1_payload(&mut payloads, &mut current, &mut current_layer);
+        }
+        if !current.is_empty() && current.len() + element_prefix + obu.bytes.len() > CHUNK {
+            flush_av1_payload(&mut payloads, &mut current, &mut current_layer);
+        }
+        if current.is_empty() {
+            current.reserve(frame.len().min(CHUNK));
+            current.push(if starts_sequence { 0x08 } else { 0 });
+            current_layer = obu.layer;
+        } else if current_layer.is_none() {
+            current_layer = obu.layer;
+        }
+        av1_write_leb128(obu.bytes.len(), &mut current);
+        current.extend_from_slice(obu.bytes);
+    }
+    flush_av1_payload(&mut payloads, &mut current, &mut current_layer);
+    payloads
+}
 
 /// The NAL units of an Annex B access unit, without their start codes. As
 /// libwebrtc finds them: a start code is 0 0 1, with at most one more zero
@@ -448,6 +624,7 @@ impl Assembler {
             Codec::Vp8 => self.vp8(packet.payload, first),
             Codec::H264 => self.h264(packet.payload),
             Codec::H265 => self.h265(packet.payload),
+            Codec::Av1 => self.damaged = true,
         }
         // Packets that never end their frame would grow it without end.
         if self.frame.len() > MAX_FRAME {
@@ -1008,6 +1185,7 @@ impl Held {
         let payload_type = match packet.payload_type {
             H264_RTX => H264,
             VP8_RTX => VP8,
+            AV1_RTX => AV1,
             other => other,
         };
         Some(Self {
@@ -1302,6 +1480,119 @@ mod tests {
         assert_eq!(picture(&next[0]), (picture(&packets[0]) + 1) & 0x7fff);
     }
 
+    #[test]
+    fn packetizes_av1_obus_and_omits_temporal_delimiter_and_tile_list() {
+        let mut packetizer = Packetizer::new(77, Codec::Av1);
+        let sequence_header = [0x0a, 0x02, 0xaa, 0xbb];
+        let frame_header = [0x32, 0x03, 0xdd, 0xee, 0xff];
+        let frame = [
+            &[0x12, 0x00][..], // temporal delimiter
+            &sequence_header[..],
+            &[0x42, 0x01, 0xcc][..], // tile list
+            &frame_header[..],
+        ]
+        .concat();
+
+        let packets = packetizer.packets(&frame, 9000);
+        assert_eq!(packets.len(), 1);
+        let packet = parse(&packets[0]).unwrap();
+        assert_eq!(packet.payload_type, AV1);
+        assert!(packet.marker);
+        assert_eq!(packet.timestamp, 9000);
+
+        // W=0 means each aggregated OBU element has a leb128 length.
+        assert_eq!(packet.payload[0], 0x08, "new coded sequence (N), W=0");
+        let (first_len, first_prefix) = av1_read_leb128(&packet.payload[1..]).unwrap();
+        assert_eq!(first_len, sequence_header.len());
+        let second_at = 1 + first_prefix + first_len;
+        assert_eq!(
+            &packet.payload[1 + first_prefix..second_at],
+            &sequence_header
+        );
+        let (last_len, last_prefix) = av1_read_leb128(&packet.payload[second_at..]).unwrap();
+        assert_eq!(last_len, frame_header.len());
+        assert_eq!(&packet.payload[second_at + last_prefix..], &frame_header);
+        assert!(packet.payload.len() <= CHUNK);
+    }
+
+    #[test]
+    fn fragments_large_av1_obus_with_aom_z_y_w_and_n_fields() {
+        let sequence_header = [0x0a, 0x02, 0xaa, 0xbb];
+        let mut frame_obu = vec![0x32]; // frame OBU with an obu_size field
+        av1_write_leb128(2300, &mut frame_obu);
+        frame_obu.extend((0..2300).map(|index| index as u8));
+        let frame = [&sequence_header[..], &frame_obu].concat();
+        let mut packetizer = Packetizer::new(77, Codec::Av1);
+        let packets = packetizer.packets(&frame, 9000);
+        assert_eq!(packets.len(), 4);
+
+        let expected_aggregation = [0x08, 0x40, 0xc0, 0x80];
+        let expected_lengths = [4, 1097, 1097, 109];
+        let mut joined = Vec::new();
+        for (index, sent) in packets.iter().enumerate() {
+            let packet = parse(sent).unwrap();
+            let aggregation = packet.payload[0];
+            assert_eq!(aggregation, expected_aggregation[index]);
+            assert_eq!(aggregation & 0x30, 0, "W=0: length-prefix each element");
+            assert_eq!(aggregation & 0x07, 0, "reserved bits are zero");
+            assert_eq!(packet.marker, index == 3);
+            let (length, prefix) = av1_read_leb128(&packet.payload[1..]).unwrap();
+            assert_eq!(length, expected_lengths[index]);
+            assert_eq!(length, packet.payload.len() - 1 - prefix);
+            assert!(packet.payload.len() <= CHUNK);
+            joined.extend_from_slice(&packet.payload[1 + prefix..]);
+        }
+        assert_eq!(
+            joined, frame,
+            "internal obu_size and bytes remain unchanged"
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_av1_obus_without_emitting_partial_frames() {
+        let malformed: [&[u8]; 6] = [
+            &[0x80, 0x00],       // forbidden bit
+            &[0x0a],             // missing size
+            &[0x0a, 0x80],       // unterminated size
+            &[0x0a, 0x02, 0xaa], // payload size overflows the frame
+            &[0x0c],             // missing extension header
+            &[0x0c, 0x01],       // nonzero extension reserved bits
+        ];
+        let mut packetizer = Packetizer::new(77, Codec::Av1);
+        for frame in malformed {
+            assert!(
+                packetizer.packets(frame, 9000).is_empty(),
+                "malformed frame {frame:?}"
+            );
+        }
+        let oversized = vec![0; MAX_FRAME + 1];
+        assert!(packetizer.packets(&oversized, 9000).is_empty());
+    }
+
+    #[test]
+    fn av1_assembler_never_reports_an_unsupported_frame() {
+        let mut packetizer = Packetizer::new(77, Codec::Av1);
+        let mut assembler = Assembler::new(Codec::Av1);
+        let packets = packetizer.packets(&[0x0a, 0x01, 0xaa], 9000);
+        assert_eq!(packets.len(), 1);
+        let pushed = assembler.push(&parse(&packets[0]).unwrap());
+        assert!(pushed.frame.is_none());
+        assert!(pushed.lost);
+        assert!(assembler.frame.is_empty());
+    }
+
+    #[test]
+    fn retransmits_av1_packets_with_their_rtx_payload_type() {
+        let mut packetizer = Packetizer::new(5, Codec::Av1);
+        let original = packetizer.packets(&[0x0a, 0x01, 0xaa], 3000).remove(0);
+        let resent = packetizer.retransmit(&original, 6).unwrap();
+        let resent = parse(&resent).unwrap();
+        assert_eq!(resent.payload_type, AV1_RTX);
+        let restored = Held::unwrap_rtx(&resent, 5).unwrap();
+        assert_eq!(restored.payload_type, AV1);
+        assert_eq!(restored.timestamp, 3000);
+        assert_eq!(restored.payload, parse(&original).unwrap().payload);
+    }
     #[test]
     fn seals_and_opens_both_modes() {
         for mode in Transport::MODES {

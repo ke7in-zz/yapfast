@@ -529,16 +529,21 @@ impl Sink {
             self.preview_due = Some(Instant::now() + THUMBNAIL_EVERY);
         }
         if let Some(server) = self.server.take() {
-            // The GPU's H265 encoder, when it has one: Discord then chooses
-            // H265 while every viewer decodes it, and H264 otherwise.
-            let hevc = self
-                .hardware
-                .then(|| self.encoder(Codec::H265, width, height).ok())
-                .flatten();
-            let offers = match hevc {
-                Some(_) => vec![Codec::H265, stream_connection::SEND_CODEC],
-                None => vec![stream_connection::SEND_CODEC],
-            };
+            // Offer only hardware codecs whose encoders actually open.
+            // Discord chooses a codec every viewer can decode.
+            let mut offers = Vec::with_capacity(3);
+            let mut preferred = None;
+            if self.hardware {
+                for codec in [Codec::Av1, Codec::H265] {
+                    if let Ok(encoder) = self.encoder(codec, width, height) {
+                        offers.push(codec);
+                        if preferred.is_none() {
+                            preferred = Some(encoder);
+                        }
+                    }
+                }
+            }
+            offers.push(stream_connection::SEND_CODEC);
             let sender = StreamSender::start(server, width, height, self.fps, offers)?;
             let sound = if self.sound {
                 stream_audio::Capture::start(sender.sound())
@@ -549,10 +554,17 @@ impl Sink {
             } else {
                 None
             };
-            let encoder = match hevc {
+            let encoder = match preferred {
                 Some(encoder) => encoder,
                 None => self.encoder(stream_connection::SEND_CODEC, width, height)?,
             };
+            tracing::info!(
+                engine = encoder.engine(),
+                codec = encoder.codec().name(),
+                width,
+                height,
+                "encoding the stream"
+            );
             self.video = Some(Video {
                 sender,
                 encoder,
@@ -567,7 +579,15 @@ impl Sink {
         let codec = video.sender.codec().unwrap_or(video.encoder.codec());
         let resized = video.encoder.size() != (width, height);
         if resized || codec != video.encoder.codec() {
-            let encoder = self.encoder(codec, width, height)?;
+            let encoder = match self.encoder(codec, width, height) {
+                Ok(encoder) => encoder,
+                Err(error) if matches!(codec, Codec::Av1 | Codec::H265) => {
+                    tracing::warn!(?codec, %error, "could not reopen the GPU encoder; withdrawing codec");
+                    video.sender.withdraw(codec);
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
             let video = self.video.as_mut().expect("checked above");
             video.encoder = encoder;
             if resized {
@@ -599,14 +619,15 @@ impl Sink {
                 keyframe: frame.keyframe,
             }),
             Ok(None) => {}
-            // Only the GPU encodes H265: Discord chooses H264 instead, which
-            // the next frame encodes.
-            Err(error) if codec == Codec::H265 => {
+            // Hardware-only codecs need a new choice from Discord; H264
+            // remains available even if every GPU encoder has failed.
+            Err(error) if matches!(codec, Codec::Av1 | Codec::H265) => {
                 tracing::warn!(
+                    ?codec,
                     error = format!("{error:#}"),
-                    "the GPU's H265 encoder failed"
+                    "the GPU's encoder failed; withdrawing codec"
                 );
-                video.sender.withdraw(Codec::H265);
+                video.sender.withdraw(codec);
             }
             Err(error) => return Err(error),
         }
@@ -631,7 +652,7 @@ impl Sink {
             ?codec,
             width,
             height,
-            "encoding the stream"
+            "opened a stream encoder"
         );
         Ok(encoder)
     }

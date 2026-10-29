@@ -57,8 +57,10 @@
 // connected there hear of it with op 12, and get the recording, or the
 // Annex B file FAKE_DISCORD_CAMERA names, once they ask with op 15. Alice's camera
 // is decrypted and its frames counted; GET /_control/call-video lists what
-// each call connection sent and asked for. A Go Live stream's video is decrypted and its VP8 frames
-// counted; GET /_control/video lists what each stream received. POST
+// each call connection sent and asked for.
+// A Go Live stream's video is decrypted; VP8/H264/H265 frames are counted,
+// and AV1's RTP aggregation and OBU framing are checked. GET /_control/video
+// lists what each stream received.
 // /_control/voice-move moves Alice's call in the server to another voice
 // server, and GET /_control/voice-identifies lists the tokens voice
 // connections identified with. POST /_control/elsewhere has Alice join the
@@ -3140,6 +3142,14 @@ type Received = {
   keyframes: number;
   width: number;
   height: number;
+  /** AV1 RTP payloads checked against their aggregation and OBU structure. */
+  av1Packets: number;
+  av1ValidPackets: number;
+  av1MalformedPackets: number;
+  av1Frames: number;
+  av1Markers: number;
+  av1FragmentedPackets: number;
+  av1Obus: number;
   /** RTCP sender reports, and the packet count the last one gave. */
   senderReports: number;
   reportedPackets: number;
@@ -3156,8 +3166,11 @@ type Received = {
   nacked: number | null;
   retransmitted: number;
   badRetransmissions: number;
+  lastRtxPayloadType: number | null;
 };
 const received = new Map<number, Received>();
+type Av1Validation = { timestamp?: number; fragment?: Buffer };
+const av1Validation = new WeakMap<Received, Av1Validation>();
 
 /** What a call connection sent, by its audio SSRC: Opus packets, those that
  *  didn't open, the silent frames among them and those longer than silence,
@@ -3466,9 +3479,12 @@ function receiveCallCamera(ws: Socket, d: any) {
     announced: d.streams?.[0]?.max_resolution ?? null,
     codec: codec.name, payloadType: codec.payloadType,
     packets: 0, undecryptable: 0, unattached: 0, frames: 0, keyframes: 0, width: 0, height: 0,
+    av1Packets: 0, av1ValidPackets: 0, av1MalformedPackets: 0, av1Frames: 0,
+    av1Markers: 0, av1FragmentedPackets: 0, av1Obus: 0,
     senderReports: 0, reportedPackets: 0,
     audioPackets: 0, audioUndecryptable: 0, audioSenderReports: 0, speaking: null,
     ssrc, rtcpCounter: 1, nacked: null, retransmitted: 0, badRetransmissions: 0, stops: 0,
+    lastRtxPayloadType: null,
   };
   callCameras.set(video, record);
   receivedRtx.set(Number(d.rtx_ssrc ?? video + 1), record);
@@ -3692,6 +3708,7 @@ function nack(stream: Received, sequence: number) {
 function receiveRtx(stream: Received, packet: Buffer) {
   const plain = openRtp(packet, stream.key);
   const { extensions, at } = plain ? rtpExtensions(plain) : { extensions: new Map<number, Buffer>(), at: 0 };
+  stream.lastRtxPayloadType = plain ? (plain[1]! & 0x7f) : null;
   const good =
     plain &&
     (plain[1]! & 0x7f) === stream.payloadType + 1 &&
@@ -3773,7 +3790,7 @@ function chooseStreamCodec(record: Received) {
   record.socket?.send(JSON.stringify({ op: 14, d: { video_codec: pick.name } }));
 }
 
-/** Counts a video packet: frames end with the marker bit; keyframes carry their size. */
+/** Counts video packets and validates AV1 RTP aggregation/OBU framing. */
 function receiveVideo(packet: Buffer) {
   const ssrc = packet.readUInt32BE(8);
   const stream = received.get(ssrc) ?? callCameras.get(ssrc);
@@ -3793,14 +3810,152 @@ function receiveVideo(packet: Buffer) {
   // Report the first packet lost, as a viewer would, to see it resent.
   if (stream.nacked === null) nack(stream, plain.readUInt16BE(2));
   const payload = plain.subarray(at);
-  const size = stream.codec === "H264" ? h264Keyframe(payload)
-    : stream.codec === "H265" ? h265Keyframe(payload)
-    : vp8Keyframe(payload);
-  if (size) {
-    stream.keyframes++;
-    [stream.width, stream.height] = size;
+  const marker = Boolean(plain[1]! & 0x80);
+  if (stream.codec === "AV1") {
+    stream.av1Packets++;
+    if (marker) stream.av1Markers++;
+    const checked = validateAv1Payload(stream, payload, plain.readUInt32BE(4), marker);
+    if (checked.valid) {
+      stream.av1ValidPackets++;
+      stream.av1Obus += checked.completedObus;
+      if (payload[0]! & 0xc0) stream.av1FragmentedPackets++;
+      if (marker) stream.av1Frames++;
+    } else {
+      stream.av1MalformedPackets++;
+    }
+  } else {
+    const size = stream.codec === "H264" ? h264Keyframe(payload)
+      : stream.codec === "H265" ? h265Keyframe(payload)
+      : vp8Keyframe(payload);
+    if (size) {
+      stream.keyframes++;
+      [stream.width, stream.height] = size;
+    }
   }
-  if (plain[1]! & 0x80) stream.frames++;
+  if (marker) stream.frames++;
+}
+
+/** Reads one unsigned LEB128 value and returns its value and next byte. */
+function av1Leb128(bytes: Buffer, at: number): [number, number] | undefined {
+  let value = 0;
+  let shift = 0;
+  for (let index = 0; index < 8 && at < bytes.length; index++, shift += 7) {
+    const byte = bytes[at++]!;
+    const part = (byte & 0x7f) * 2 ** shift;
+    if (value > Number.MAX_SAFE_INTEGER - part) return;
+    value += part;
+    if (!(byte & 0x80)) return [value, at];
+  }
+}
+
+/** Parses AV1 RTP aggregation elements, including length-prefixed fragments. */
+function av1RtpElements(payload: Buffer): {
+  z: boolean; y: boolean; n: boolean; elements: Buffer[];
+} | undefined {
+  if (payload.length < 2 || (payload[0]! & 0x07)) return;
+  const aggregation = payload[0]!;
+  const z = Boolean(aggregation & 0x80);
+  const y = Boolean(aggregation & 0x40);
+  const w = (aggregation >> 4) & 0x03;
+  const n = Boolean(aggregation & 0x08);
+  if (z && n) return;
+  const elements: Buffer[] = [];
+  let at = 1;
+  if (w === 0) {
+    while (at < payload.length) {
+      const length = av1Leb128(payload, at);
+      if (!length || length[0] === 0 || length[0] > payload.length - length[1]) return;
+      const end = length[1] + length[0];
+      elements.push(payload.subarray(length[1], end));
+      at = end;
+    }
+  } else {
+    for (let index = 0; index < w; index++) {
+      let size: number;
+      if (index === w - 1) {
+        size = payload.length - at;
+      } else {
+        const length = av1Leb128(payload, at);
+        if (!length || length[0] === 0 || length[0] > payload.length - length[1]) return;
+        size = length[0];
+        at = length[1];
+      }
+      if (size === 0 || size > payload.length - at) return;
+      elements.push(payload.subarray(at, at + size));
+      at += size;
+    }
+    if (at !== payload.length) return;
+  }
+  return elements.length ? { z, y, n, elements } : undefined;
+}
+
+/** Checks an unfragmented AV1 OBU, including header and optional size field. */
+function av1ObuValid(obu: Buffer): boolean {
+  if (!obu.length) return false;
+  const header = obu[0]!;
+  const type = (header >> 3) & 0x0f;
+  if ((header & 0x81) || type === 0 || type === 2 || type === 8 || (type >= 9 && type <= 14))
+    return false;
+  let at = 1;
+  if (header & 0x04) {
+    if (at >= obu.length || (obu[at]! & 0x07)) return false;
+    at++;
+  }
+  if (header & 0x02) {
+    const size = av1Leb128(obu, at);
+    if (!size || size[0] !== obu.length - size[1]) return false;
+  }
+  return true;
+}
+
+/** Checks OBU fragments across RTP packets and validates temporal-unit markers. */
+function validateAv1Payload(
+  stream: Received, payload: Buffer, timestamp: number, marker: boolean,
+): { valid: boolean; completedObus: number } {
+  const parsed = av1RtpElements(payload);
+  const previous = av1Validation.get(stream) ?? {};
+  let fragment = previous.fragment;
+  let invalid = !parsed
+    || (parsed.n && parsed.z)
+    || (marker && parsed.y)
+    || (previous.timestamp !== undefined && previous.timestamp !== timestamp)
+    || Boolean(fragment) !== Boolean(parsed?.z)
+    || (parsed?.n && previous.timestamp !== undefined);
+  let completedObus = 0;
+  if (!invalid && parsed) {
+    for (let index = 0; index < parsed.elements.length; index++) {
+      const first = index === 0;
+      const last = index === parsed.elements.length - 1;
+      let obu = parsed.elements[index]!;
+      const continuing = first && parsed.z;
+      if (continuing) {
+        obu = Buffer.concat([fragment!, obu]);
+        fragment = undefined;
+      } else if (first && fragment) {
+        invalid = true;
+        break;
+      }
+      if (last && parsed.y) {
+        fragment = obu;
+        continue;
+      }
+      if (!av1ObuValid(obu)) {
+        invalid = true;
+        break;
+      }
+      completedObus++;
+    }
+  }
+  if (marker && fragment) invalid = true;
+  if (invalid) {
+    av1Validation.set(stream, {});
+    return { valid: false, completedObus: 0 };
+  }
+  av1Validation.set(stream, marker ? {} : {
+    timestamp,
+    ...(fragment ? { fragment } : {}),
+  });
+  return { valid: true, completedObus };
 }
 
 /** The size a VP8 keyframe's first packet gives. */
@@ -4046,9 +4201,12 @@ function voiceMessage(ws: Socket, text: string) {
           codec: offered?.name ?? "VP8", payloadType: offered?.payload_type ?? 105,
           offers: videoOffers(d.codecs), socket: ws,
           packets: 0, undecryptable: 0, unattached: 0, frames: 0, keyframes: 0, width: 0, height: 0,
+          av1Packets: 0, av1ValidPackets: 0, av1MalformedPackets: 0, av1Frames: 0,
+          av1Markers: 0, av1FragmentedPackets: 0, av1Obus: 0,
           senderReports: 0, reportedPackets: 0,
           audioPackets: 0, audioUndecryptable: 0, audioSenderReports: 0, speaking: null,
           ssrc: ws.data.ssrc, rtcpCounter: 1, nacked: null, retransmitted: 0, badRetransmissions: 0,
+          lastRtxPayloadType: null,
         };
         received.set(ws.data.ssrc + 1, record);
         receivedAudio.set(ws.data.ssrc, record);

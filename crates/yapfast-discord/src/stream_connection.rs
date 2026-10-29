@@ -396,7 +396,7 @@ fn send_codecs(offers: &[Codec], withdrawn: &[Codec]) -> Value {
         .iter()
         .map(|&codec| (codec, true))
         .chain(withdrawn.iter().map(|&codec| (codec, false)));
-    codecs(video.map(|(codec, encode)| (codec, encode, codec != Codec::H265)))
+    codecs(video.map(|(codec, encode)| (codec, encode, matches!(codec, Codec::Vp8 | Codec::H264))))
 }
 
 /// Select protocol's codecs for a viewer: Opus, then each of `decodes` by
