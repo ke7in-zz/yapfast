@@ -150,11 +150,8 @@ fn run_inner(
     let selector = slint::BackendSelector::new().backend_name("winit".into());
     #[cfg(windows)]
     let selector = {
-        use slint::winit_030::winit::{
-            event_loop::EventLoop, platform::windows::EventLoopBuilderExtWindows,
-        };
-        let mut events = EventLoop::<slint::winit_030::SlintEvent>::with_user_event();
-        events.with_msg_hook(crate::push_to_talk::windows_message_hook());
+        use slint::winit_030::winit::event_loop::EventLoop;
+        let events = EventLoop::<slint::winit_030::SlintEvent>::with_user_event();
         selector
             .with_winit_event_loop_builder(events)
             .with_winit_custom_application_handler(

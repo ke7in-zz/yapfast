@@ -517,9 +517,9 @@ secure desktops and session locks cannot be overridden.
 
 | Desktop | Backend and limits |
 | --- | --- |
-| Wayland | One xdg-desktop-portal GlobalShortcuts session binds the configured action IDs, offering preferred triggers. Settings show actual grants and desktop-assigned keys, not an assumed assignment. Activated/Deactivated hold PTT and delimit command presses. The live desktop editor requires portal version 2; version 1 still supports the shortcuts, with assignments managed by the desktop. A desktop without GlobalShortcuts has no background command support. |
+| Wayland | In sessions identified by `WAYLAND_DISPLAY` or `XDG_SESSION_TYPE=wayland`, including Xwayland clients, one xdg-desktop-portal GlobalShortcuts session binds the configured action IDs and offers preferred triggers. Settings show actual grants and desktop-assigned keys, not an assumed assignment. Activated/Deactivated hold PTT and delimit command presses. The live desktop editor requires portal version 2; version 1 still supports the shortcuts, with assignments managed by the desktop. Without portal GlobalShortcuts, background commands are unavailable; the app does not report focused-only XInput as global support. |
 | X11 | XInput 2.1 raw key events on the root window, including while another client holds a keyboard grab. Keys also reach the focused app. Initial held keys and device changes are synchronized without synthesizing command presses. |
-| Windows | Commands use Winit's application-lifetime Raw Input receiver with `RIDEV_INPUTSINK`, including with no Yapfast window. PTT retains its separate `WH_KEYBOARD_LL` hook. Session, desktop and suspend notifications clear stale keys; commands are unavailable if their required registrations fail. The original keyboard registration is restored on teardown. |
+| Windows | Commands use Winit's application-lifetime Raw Input receiver with `RIDEV_INPUTSINK`, including with no Yapfast window. A subclass of that receiver handles directly delivered session and suspend/resume messages; command availability requires the subclass and notification registrations. The original keyboard registration is restored on teardown. Native Windows background-input, fullscreen, and session-transition behavior has not been verified. PTT's low-level hook may miss input in elevated applications under Windows' integrity restrictions; Raw Input delivery with an elevated foreground application is unverified. |
 
 When background input is unavailable, only PTT can fall back to focused-window
 events; settings say it is focused-only and losing focus releases it.
@@ -537,7 +537,12 @@ permission denial does not repeatedly prompt.
 `x11_delivers_chords_and_ptt_without_consuming_the_key` exercises a separate
 client's keyboard grab on a private X server.
 `one_portal_session_binds_all_ids_and_emits_command_edges` exercises PTT,
-command edge deduplication and the version-1 editor limit on a private bus.
+command edge deduplication, missing and changing assignment descriptions, and
+the version-1 editor limit on a private bus.
 Both ignored tests require their documented private environments.
 `push_to_talk_sends_only_while_the_key_is_held` against the fake Discord checks
 that beeps with the key up send nothing and with it held do.
+
+`game_stream_hotkey_fails_closed_and_toggles_only_a_recognized_game` checks
+that a game-only command does not fall back without a running game, and that a
+recognized test process streams and stops through the fake call.

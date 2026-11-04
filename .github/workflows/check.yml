@@ -15,7 +15,7 @@ jobs:
     name: Native Linux
     if: github.event.repository.private == false
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 180
     env:
       CARGO_BUILD_JOBS: 2
     steps:

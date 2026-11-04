@@ -37,6 +37,20 @@ pub(super) enum Global {
     X11 { _events: X11 },
 }
 
+pub(super) fn is_wayland_session() -> bool {
+    wayland_session(
+        std::env::var_os("WAYLAND_DISPLAY").as_deref(),
+        std::env::var_os("XDG_SESSION_TYPE").as_deref(),
+    )
+}
+
+fn wayland_session(
+    wayland_display: Option<&std::ffi::OsStr>,
+    session_type: Option<&std::ffi::OsStr>,
+) -> bool {
+    wayland_display.is_some_and(|value| !value.is_empty())
+        || session_type.is_some_and(|value| value == "wayland")
+}
 impl Global {
     pub fn start(
         bindings: &Bindings,
@@ -47,7 +61,7 @@ impl Global {
         if !any_binding(bindings) {
             return (None, None);
         }
-        if std::env::var_os("WAYLAND_DISPLAY").is_some_and(|value| !value.is_empty()) {
+        if is_wayland_session() {
             let (configure, requests) = mpsc::unbounded_channel();
             let bindings = bindings.clone();
             let session = runtime.spawn(async move {
@@ -523,8 +537,9 @@ fn update_grants(
                 .and_then(|value| match &**value {
                     Value::Str(text) if !text.is_empty() => Some(text.to_string()),
                     _ => None,
-                });
-            statuses.set(*binding, Reach::Everywhere(description));
+                })
+                .unwrap_or_default();
+            statuses.set(*binding, Reach::Everywhere(Some(description)));
         } else if *binding == Binding::Talk {
             statuses.set(
                 *binding,
@@ -974,6 +989,15 @@ mod tests {
         assert_eq!(portal_trigger(&chord).as_deref(), Some("CTRL+ALT+LOGO+v"));
     }
 
+    #[test]
+    fn wayland_session_type_selects_the_portal_without_a_wayland_socket() {
+        use std::ffi::OsStr;
+
+        assert!(wayland_session(None, Some(OsStr::new("wayland"))));
+        assert!(wayland_session(Some(OsStr::new("wayland-0")), None));
+        assert!(!wayland_session(None, Some(OsStr::new("x11"))));
+    }
+
     fn wait_held(held: bool) {
         let until = Instant::now() + Duration::from_secs(2);
         while yapfast_core::push_to_talk::held() != held {
@@ -1090,20 +1114,24 @@ mod tests {
                 let bound = shortcuts
                     .iter()
                     .map(|(id, details)| {
-                        let preferred = details
-                            .get("preferred_trigger")
-                            .and_then(|value| match &**value {
-                                Value::Str(value) => Some(value.to_uppercase()),
-                                _ => None,
-                            })
-                            .unwrap_or_else(|| "V".into());
-                        (
-                            id.clone(),
-                            HashMap::from([(
-                                "trigger_description".to_owned(),
-                                Value::from(preferred),
-                            )]),
-                        )
+                        if id == LEAVE_ID {
+                            (id.clone(), HashMap::new())
+                        } else {
+                            let preferred = details
+                                .get("preferred_trigger")
+                                .and_then(|value| match &**value {
+                                    Value::Str(value) => Some(value.to_uppercase()),
+                                    _ => None,
+                                })
+                                .unwrap_or_else(|| "V".into());
+                            (
+                                id.clone(),
+                                HashMap::from([(
+                                    "trigger_description".to_owned(),
+                                    Value::from(preferred),
+                                )]),
+                            )
+                        }
                     })
                     .collect::<Vec<_>>();
                 respond(
@@ -1176,12 +1204,54 @@ mod tests {
                 .unwrap();
         }
 
+        fn granted(description: &str) -> HashMap<String, OwnedValue> {
+            HashMap::from([(
+                "trigger_description".to_owned(),
+                Value::from(description).try_to_owned().unwrap(),
+            )])
+        }
+
+        fn all_grants(
+            leave: HashMap<String, OwnedValue>,
+        ) -> Vec<(String, HashMap<String, OwnedValue>)> {
+            vec![
+                (TALK_ID.to_owned(), granted("V")),
+                (STREAM_ID.to_owned(), granted("CTRL+C")),
+                (LEAVE_ID.to_owned(), leave),
+            ]
+        }
+
+        async fn shortcuts_changed(
+            connection: &Connection,
+            session: &OwnedObjectPath,
+            shortcuts: Vec<(String, HashMap<String, OwnedValue>)>,
+        ) {
+            connection
+                .emit_signal(
+                    None::<()>,
+                    PATH,
+                    SHORTCUTS,
+                    "ShortcutsChanged",
+                    &(session, shortcuts),
+                )
+                .await
+                .unwrap();
+        }
+
+        fn wait_status(watcher: &crate::push_to_talk::Watcher, binding: Binding, expected: Reach) {
+            let until = Instant::now() + Duration::from_secs(2);
+            while watcher.status(binding) != expected {
+                assert!(Instant::now() < until, "portal status did not update");
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
         #[test]
-        #[ignore = "needs a private session bus and WAYLAND_DISPLAY"]
+        #[ignore = "needs a private session bus and a Wayland session"]
         fn one_portal_session_binds_all_ids_and_emits_command_edges() {
             assert!(
-                std::env::var_os("WAYLAND_DISPLAY").is_some_and(|value| !value.is_empty()),
-                "set WAYLAND_DISPLAY for the private portal scenario"
+                is_wayland_session(),
+                "set WAYLAND_DISPLAY or XDG_SESSION_TYPE=wayland for the private portal scenario"
             );
             yapfast_core::push_to_talk::hold(false);
 
@@ -1238,6 +1308,45 @@ mod tests {
                 thread::sleep(Duration::from_millis(10));
             }
             assert_eq!(commands.lock().unwrap().as_slice(), [Command::ToggleStream]);
+
+            wait_status(
+                &watcher,
+                Binding::LeaveVoice,
+                Reach::Everywhere(Some(String::new())),
+            );
+            let session = OwnedObjectPath::try_from(format!("{PATH}/session/test/1")).unwrap();
+            zbus::block_on(shortcuts_changed(
+                server.inner(),
+                &session,
+                all_grants(granted("ALT+X")),
+            ));
+            wait_status(
+                &watcher,
+                Binding::LeaveVoice,
+                Reach::Everywhere(Some("ALT+X".into())),
+            );
+
+            zbus::block_on(shortcuts_changed(
+                server.inner(),
+                &session,
+                all_grants(granted("")),
+            ));
+            wait_status(
+                &watcher,
+                Binding::LeaveVoice,
+                Reach::Everywhere(Some(String::new())),
+            );
+            zbus::block_on(shortcuts_changed(
+                server.inner(),
+                &session,
+                all_grants(HashMap::new()),
+            ));
+            wait_status(
+                &watcher,
+                Binding::LeaveVoice,
+                Reach::Everywhere(Some(String::new())),
+            );
+
             assert!(
                 !watcher.configure_shortcuts(),
                 "a live version-1 portal cannot open the version-2 editor"

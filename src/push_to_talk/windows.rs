@@ -1,5 +1,4 @@
 use std::{
-    ffi::c_void,
     mem::size_of,
     ptr,
     sync::{
@@ -34,11 +33,12 @@ use windows_sys::Win32::{
             },
             RAWINPUTDEVICE, RIDEV_DEVNOTIFY, RIDEV_INPUTSINK, RegisterRawInputDevices,
         },
+        Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
         WindowsAndMessaging::{
             CallNextHookEx, EVENT_SYSTEM_DESKTOPSWITCH, GetMessageW, HC_ACTION, KBDLLHOOKSTRUCT,
             LLKHF_EXTENDED, MSG, PM_NOREMOVE, PeekMessageW, PostThreadMessageW, SetWindowsHookExW,
-            UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN,
-            WM_SYSKEYUP,
+            UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_NCDESTROY, WM_QUIT,
+            WM_SYSKEYDOWN, WM_SYSKEYUP,
         },
     },
 };
@@ -64,6 +64,7 @@ const PBT_APMSUSPEND_VALUE: u32 = 0x0004;
 const PBT_APMRESUMECRITICAL_VALUE: u32 = 0x0006;
 const PBT_APMRESUMESUSPEND_VALUE: u32 = 0x0007;
 const PBT_APMRESUMEAUTOMATIC_VALUE: u32 = 0x0012;
+const HOTKEY_SUBCLASS_ID: usize = 0x5941_5046;
 const WINEVENT_OUTOFCONTEXT_VALUE: u32 = 0x0000;
 const WINEVENT_SKIPOWNPROCESS_VALUE: u32 = 0x0002;
 
@@ -82,6 +83,7 @@ struct Input {
     statuses: Option<StatusReporter>,
     original: Option<KeyboardRegistration>,
     target: Option<isize>,
+    subclass_installed: bool,
     input_sink: bool,
     wts_registered: bool,
     win_event_hook: Option<usize>,
@@ -97,7 +99,7 @@ impl Input {
             statuses: None,
             original: None,
             target: None,
-            input_sink: false,
+            subclass_installed: false,
             wts_registered: false,
             win_event_hook: None,
             power_notification: None,
@@ -208,6 +210,7 @@ impl Shared {
             // A failed restoration can leave the sink registered after a
             // notification failure. Unavailable input must not execute commands.
             if !input.input_sink
+                || !input.subclass_installed
                 || !input.wts_registered
                 || input.win_event_hook.is_none()
                 || input.power_notification.is_none()
@@ -241,6 +244,25 @@ impl Shared {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         input.synchronize_keys();
+    }
+    fn receiver_destroyed(&self, target: isize) {
+        let mut input = self
+            .input
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if input.target != Some(target) {
+            return;
+        }
+        input.reset_matcher();
+        let restored = restore_input_sink(&mut input);
+        let notifications_unregistered = unregister_notifications(&mut input);
+        input.command_status(Reach::Unavailable(
+            "Windows' global-input receiver was destroyed",
+        ));
+        if restored && notifications_unregistered {
+            input.original = None;
+            input.target = None;
+        }
     }
 
     fn resumed(&self) {
@@ -365,6 +387,12 @@ fn discover_receiver(input: &mut Input) -> bool {
 
 fn activate(input: &mut Input) {
     if let Some(target) = input.target {
+        if !input.subclass_installed {
+            // SAFETY: This is Winit's live receiver HWND on the event-loop thread.
+            input.subclass_installed = unsafe {
+                SetWindowSubclass(target as _, Some(session_messages), HOTKEY_SUBCLASS_ID, 0) != 0
+            };
+        }
         if !input.wts_registered {
             // SAFETY: `target` is the existing Winit raw-input receiver HWND.
             input.wts_registered = unsafe {
@@ -398,13 +426,14 @@ fn activate(input: &mut Input) {
         }
     }
     if input.has_commands()
-        && (!input.wts_registered
+        && (!input.subclass_installed
+            || !input.wts_registered
             || input.win_event_hook.is_none()
             || input.power_notification.is_none())
     {
         restore_input_sink(input);
         input.command_status(Reach::Unavailable(
-            "Windows could not watch session and power changes reliably",
+            "Windows could not monitor session, desktop, and power transitions safely",
         ));
         return;
     }
@@ -505,6 +534,21 @@ fn unregister_notifications(input: &mut Input) -> bool {
             tracing::error!("Windows rejected removing power notifications");
         }
     }
+    if input.subclass_installed {
+        if let Some(target) = input.target {
+            // SAFETY: This removes the subclass installed on the same HWND.
+            if unsafe {
+                RemoveWindowSubclass(target as _, Some(session_messages), HOTKEY_SUBCLASS_ID) != 0
+            } {
+                input.subclass_installed = false;
+            } else {
+                clean = false;
+                tracing::error!("Windows rejected removing the raw-input receiver subclass");
+            }
+        } else {
+            clean = false;
+        }
+    }
     clean
 }
 
@@ -518,6 +562,41 @@ unsafe extern "system" fn desktop_switch(
     _time: u32,
 ) {
     shared().clear_stale();
+}
+unsafe extern "system" fn session_messages(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    subclass_id: usize,
+    _ref_data: usize,
+) -> LRESULT {
+    if subclass_id == HOTKEY_SUBCLASS_ID {
+        match message {
+            WM_WTSSESSION_CHANGE_VALUE => match wparam as u32 {
+                WTS_CONSOLE_CONNECT_VALUE
+                | WTS_CONSOLE_DISCONNECT_VALUE
+                | WTS_REMOTE_CONNECT_VALUE
+                | WTS_REMOTE_DISCONNECT_VALUE
+                | WTS_SESSION_LOGON_VALUE
+                | WTS_SESSION_LOGOFF_VALUE
+                | WTS_SESSION_LOCK_VALUE
+                | WTS_SESSION_UNLOCK_VALUE => shared().clear_stale(),
+                _ => {}
+            },
+            WM_POWERBROADCAST_VALUE => match wparam as u32 {
+                PBT_APMSUSPEND_VALUE
+                | PBT_APMRESUMECRITICAL_VALUE
+                | PBT_APMRESUMESUSPEND_VALUE
+                | PBT_APMRESUMEAUTOMATIC_VALUE => shared().clear_stale(),
+                _ => {}
+            },
+            WM_NCDESTROY => shared().receiver_destroyed(hwnd as isize),
+            _ => {}
+        }
+    }
+    // SAFETY: The subclass always forwards the message to Winit's procedure.
+    unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
 }
 
 pub(super) struct Global {
@@ -545,40 +624,6 @@ pub(super) fn custom_application_handler() -> impl CustomApplicationHandler + 's
     let shared = shared();
     shared.handler_installed.store(true, Ordering::Release);
     InputHandler { shared }
-}
-
-pub(super) fn message_hook() -> impl FnMut(*const c_void) -> bool + 'static {
-    let shared = shared();
-    move |pointer| {
-        if pointer.is_null() {
-            return false;
-        }
-        // SAFETY: Winit passes a pointer to its MSG for the duration of this
-        // callback; this hook only reads the message fields.
-        let message = unsafe { &*(pointer.cast::<MSG>()) };
-        match message.message {
-            WM_WTSSESSION_CHANGE_VALUE => match message.wParam as u32 {
-                WTS_CONSOLE_CONNECT_VALUE
-                | WTS_CONSOLE_DISCONNECT_VALUE
-                | WTS_REMOTE_CONNECT_VALUE
-                | WTS_REMOTE_DISCONNECT_VALUE
-                | WTS_SESSION_LOGON_VALUE
-                | WTS_SESSION_LOGOFF_VALUE
-                | WTS_SESSION_LOCK_VALUE
-                | WTS_SESSION_UNLOCK_VALUE => shared.clear_stale(),
-                _ => {}
-            },
-            WM_POWERBROADCAST_VALUE => match message.wParam as u32 {
-                PBT_APMSUSPEND_VALUE
-                | PBT_APMRESUMECRITICAL_VALUE
-                | PBT_APMRESUMESUSPEND_VALUE
-                | PBT_APMRESUMEAUTOMATIC_VALUE => shared.clear_stale(),
-                _ => {}
-            },
-            _ => {}
-        }
-        false
-    }
 }
 
 pub(super) fn teardown() -> bool {
@@ -727,6 +772,14 @@ mod tests {
     use slint::winit_030::winit::{
         event_loop::EventLoop, platform::windows::EventLoopBuilderExtWindows,
     };
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::UI::{
+        Input::KeyboardAndMouse::{
+            INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
+            SendInput,
+        },
+        WindowsAndMessaging::SendMessageW,
+    };
 
     #[test]
     fn a_remaining_input_sink_cannot_execute_without_session_notifications() {
@@ -801,5 +854,143 @@ mod tests {
             (restored.target, restored.flags),
             (before.target, before.flags)
         );
+    }
+    #[test]
+    #[ignore = "injects keys into the interactive Windows desktop"]
+    fn the_ptt_hook_observes_down_up_and_ignores_other_keys() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                yapfast_core::push_to_talk::hold(false);
+                yapfast_core::push_to_talk::set_on(false);
+            }
+        }
+        let _reset = Reset;
+        yapfast_core::push_to_talk::set_on(true);
+        let bindings = Bindings {
+            talk: Some(super::super::Keybind {
+                scancode: 0x2f,
+                name: "V".into(),
+                trigger: None,
+            }),
+            ..Bindings::default()
+        };
+        let hook = Hook::start(0x2f, StatusReporter::new(&bindings, |_, _| {}))
+            .expect("Windows did not install the PTT hook");
+        send_key(0x2f, false);
+        wait_held(true);
+        send_key(0x2f, true);
+        wait_held(false);
+        send_key(0x30, false);
+        send_key(0x30, true);
+        thread::sleep(Duration::from_millis(100));
+        assert!(!yapfast_core::push_to_talk::held());
+        drop(hook);
+    }
+
+    fn send_key(scancode: u16, up: bool) {
+        let input = INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: 0,
+                    wScan: scancode,
+                    dwFlags: KEYEVENTF_SCANCODE | if up { KEYEVENTF_KEYUP } else { 0 },
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        // SAFETY: One correctly sized synthetic keyboard input.
+        let sent = unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) };
+        assert_eq!(sent, 1);
+    }
+
+    fn wait_held(held: bool) {
+        let until = Instant::now() + Duration::from_secs(2);
+        while yapfast_core::push_to_talk::held() != held {
+            assert!(Instant::now() < until, "PTT state did not become {held}");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a native Windows desktop and sends messages to Winit's input HWND"]
+    fn sent_session_and_power_messages_clear_modifier_state() {
+        let _handler = custom_application_handler();
+        let mut builder = EventLoop::builder();
+        builder.with_any_thread(true);
+        let _events = builder.build().unwrap();
+        let count = Arc::new(AtomicU32::new(0));
+        let heard = count.clone();
+        let actions = Actions::new(move |_| {
+            heard.fetch_add(1, Ordering::Relaxed);
+        });
+        actions.set_enabled(true);
+        let bindings = Bindings {
+            leave_voice: Some(super::super::Chord {
+                key: super::super::Keybind {
+                    scancode: 0x26,
+                    name: "L".into(),
+                    trigger: None,
+                },
+                modifiers: super::super::ModifierMask::CTRL | super::super::ModifierMask::SHIFT,
+            }),
+            ..Bindings::default()
+        };
+        let statuses = StatusReporter::new(&bindings, |_, _| {});
+        let global = Global::start(&bindings, statuses, actions);
+        let target = shared()
+            .input
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .target
+            .expect("Winit's keyboard receiver is missing");
+        assert!(
+            shared()
+                .input
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .subclass_installed
+        );
+
+        let key = |scancode, pressed| shared().key(DeviceId::dummy(), scancode, pressed);
+        key(0x1d, true);
+        // SendMessage exercises the WndProc path; winit's queue hook cannot
+        // observe this direct delivery.
+        unsafe {
+            SendMessageW(
+                target as _,
+                WM_POWERBROADCAST_VALUE,
+                PBT_APMRESUMEAUTOMATIC_VALUE as usize,
+                0,
+            );
+        }
+        key(0x2a, true);
+        key(0x26, true);
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+        key(0x26, false);
+        key(0x2a, false);
+
+        key(0x1d, true);
+        unsafe {
+            SendMessageW(
+                target as _,
+                WM_WTSSESSION_CHANGE_VALUE,
+                WTS_SESSION_UNLOCK_VALUE as usize,
+                0,
+            );
+        }
+        key(0x2a, true);
+        key(0x26, true);
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+        key(0x26, false);
+        key(0x2a, false);
+
+        key(0x1d, true);
+        key(0x2a, true);
+        key(0x26, true);
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+        drop(global);
     }
 }

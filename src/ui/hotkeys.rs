@@ -1,7 +1,6 @@
 //! Global command bindings live with the application, not its disposable window.
 
 use std::fs::{File, OpenOptions};
-use std::hash::{Hash, Hasher};
 
 use slint::winit_030::winit::{
     event::{ElementState, WindowEvent},
@@ -131,7 +130,7 @@ impl Adapter {
             self.hotkeys.owner = None;
             self.hotkeys.retry.stop();
             self.hotkeys.notice = None;
-        } else if self.hotkeys.owner.is_none() {
+        } else if self.hotkeys.owner.is_none() && !self.hotkeys.retry.running() {
             match self.claim_hotkeys() {
                 Ok(file) => {
                     self.hotkeys.owner = Some(file);
@@ -158,6 +157,7 @@ impl Adapter {
                         if let Some(adapter) = weak.upgrade()
                             && let Ok(mut adapter) = adapter.try_borrow_mut()
                         {
+                            adapter.hotkeys.retry.stop();
                             adapter.update_hotkey_owner();
                         }
                     },
@@ -183,24 +183,10 @@ impl Adapter {
                 std::fs::TryLockError::Error(std::io::Error::other("no per-user data directory"))
             })?;
             std::fs::create_dir_all(&directory).map_err(std::fs::TryLockError::Error)?;
-            let mut session = std::collections::hash_map::DefaultHasher::new();
-            for key in ["XDG_SESSION_ID", "WAYLAND_DISPLAY", "DISPLAY"] {
-                std::env::var_os(key).hash(&mut session);
-            }
-            #[cfg(windows)]
-            {
-                use windows_sys::Win32::System::{
-                    RemoteDesktop::ProcessIdToSessionId, Threading::GetCurrentProcessId,
-                };
-                let mut id = 0;
-                // SAFETY: the output pointer is valid; only this process's session is queried.
-                if unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut id) } == 0 {
-                    return Err(std::fs::TryLockError::Error(std::io::Error::last_os_error()));
-                }
-                id.hash(&mut session);
-            }
+            let identity = lock_identity().map_err(std::fs::TryLockError::Error)?;
+            let hash = stable_lock_hash(&identity);
             self.hotkeys.lock_path =
-                Some(directory.join(format!("global-hotkeys-{:016x}.lock", session.finish())));
+                Some(directory.join(format!("global-hotkeys-{hash:016x}.lock")));
         }
         let path = self.hotkeys.lock_path.as_ref().unwrap();
         // No contents are read or overwritten; the OS releases this lock on exit.
@@ -286,16 +272,31 @@ impl Adapter {
         window.set_toggle_stream_note(stream.into());
         window.set_leave_voice_note(status(Binding::LeaveVoice).into());
         window.set_hotkeys_desktop(
-            cfg!(target_os = "linux")
-                && std::env::var_os("WAYLAND_DISPLAY").is_some_and(|s| !s.is_empty()),
+            cfg!(target_os = "linux") && crate::push_to_talk::wayland_session(),
         );
     }
 
     fn set_command_key(&mut self, window: &YapfastWindow, binding: Binding, chord: Option<Chord>) {
+        if binding == Binding::Talk {
+            return;
+        }
+        let conflict = self.store_command_key(binding, chord);
+        self.hotkeys.rejected = conflict.map(|why| (binding, why));
+        if conflict.is_none() {
+            self.watch_hotkeys();
+        }
+        self.show_hotkeys(window);
+    }
+
+    fn store_command_key(
+        &mut self,
+        binding: Binding,
+        chord: Option<Chord>,
+    ) -> Option<&'static str> {
         let other = match binding {
             Binding::ToggleStream => self.layout.leave_voice_key.as_ref(),
             Binding::LeaveVoice => self.layout.toggle_stream_key.as_ref(),
-            Binding::Talk => return,
+            Binding::Talk => return None,
         };
         let conflict = chord.as_ref().and_then(|chord| {
             if !chord.is_valid() {
@@ -303,24 +304,27 @@ impl Adapter {
             } else if other.is_some_and(|other| same_chord(chord, other)) {
                 Some("That shortcut already controls the other voice action.")
             } else if self.layout.input_mode == InputMode::PushToTalk
-                && self.layout.push_to_talk_key.as_ref().is_some_and(|talk| chord.overlaps_talk(talk))
+                && self
+                    .layout
+                    .push_to_talk_key
+                    .as_ref()
+                    .is_some_and(|talk| chord.overlaps_talk(talk))
             {
                 Some("That shortcut overlaps the push-to-talk key. Choose a different key or modifiers.")
             } else {
                 None
             }
         });
-        self.hotkeys.rejected = conflict.map(|why| (binding, why));
-        if conflict.is_none() {
-            match binding {
-                Binding::ToggleStream => self.layout.toggle_stream_key = chord,
-                Binding::LeaveVoice => self.layout.leave_voice_key = chord,
-                Binding::Talk => return,
-            }
-            self.layout.write(&self.root);
-            self.watch_hotkeys();
+        if conflict.is_some() {
+            return conflict;
         }
-        self.show_hotkeys(window);
+        match binding {
+            Binding::ToggleStream => self.layout.toggle_stream_key = chord,
+            Binding::LeaveVoice => self.layout.leave_voice_key = chord,
+            Binding::Talk => return None,
+        }
+        self.layout.write(&self.root);
+        None
     }
 }
 
@@ -448,4 +452,248 @@ fn system_navigation(key: &Key, modifiers: ModifiersState) -> bool {
         || (modifiers.super_key()
             && matches!(key, Key::Character(text) if text.eq_ignore_ascii_case("l")))
         || (modifiers.control_key() && modifiers.alt_key() && *key == Key::Named(NamedKey::Delete))
+}
+fn stable_lock_hash(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf29ce484222325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn lock_identity() -> std::io::Result<Vec<u8>> {
+    Ok(linux_lock_identity(
+        crate::push_to_talk::wayland_session(),
+        std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+        std::env::var_os("WAYLAND_DISPLAY").as_deref(),
+        std::env::var_os("DISPLAY").as_deref(),
+        std::env::var_os("XDG_SESSION_ID").as_deref(),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_lock_identity(
+    wayland: bool,
+    runtime: Option<&std::ffi::OsStr>,
+    wayland_display: Option<&std::ffi::OsStr>,
+    x11_display: Option<&std::ffi::OsStr>,
+    session: Option<&std::ffi::OsStr>,
+) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut identity = Vec::with_capacity(64);
+    if wayland {
+        identity.extend_from_slice(b"wayland\0");
+        if let Some(runtime) = runtime {
+            let runtime = std::path::PathBuf::from(runtime);
+            let runtime = std::fs::canonicalize(&runtime).unwrap_or(runtime);
+            identity.extend_from_slice(runtime.as_os_str().as_bytes());
+        } else if let Some(display) = wayland_display {
+            let display = std::path::PathBuf::from(display);
+            let display = if display.is_absolute() {
+                std::fs::canonicalize(&display).unwrap_or(display)
+            } else {
+                display
+            };
+            identity.extend_from_slice(display.as_os_str().as_bytes());
+        } else if let Some(session) = session {
+            identity.extend_from_slice(session.as_bytes());
+        } else {
+            identity.extend_from_slice(b"session");
+        }
+    } else if let Some(display) = x11_display {
+        identity.extend_from_slice(b"x11\0");
+        identity.extend_from_slice(&x11_display_identity(display));
+    } else if let Some(session) = session {
+        identity.extend_from_slice(b"session\0");
+        identity.extend_from_slice(session.as_bytes());
+    } else {
+        identity.extend_from_slice(b"no-display");
+    }
+    identity
+}
+
+#[cfg(target_os = "linux")]
+fn x11_display_identity(display: &std::ffi::OsStr) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let raw = display.as_bytes();
+    let mut normalized = if let Some(local) = raw.strip_prefix(b"unix:") {
+        let mut normalized = Vec::with_capacity(local.len() + 1);
+        normalized.push(b':');
+        normalized.extend_from_slice(local);
+        normalized
+    } else {
+        raw.to_vec()
+    };
+    if let Some(colon) = normalized.iter().rposition(|byte| *byte == b':')
+        && let Some(dot) = normalized[colon + 1..]
+            .iter()
+            .position(|byte| *byte == b'.')
+        && normalized[colon + dot + 2..].iter().all(u8::is_ascii_digit)
+    {
+        normalized.truncate(colon + dot + 1);
+    }
+    normalized
+}
+
+#[cfg(windows)]
+fn lock_identity() -> std::io::Result<Vec<u8>> {
+    use windows_sys::Win32::System::{
+        RemoteDesktop::ProcessIdToSessionId, Threading::GetCurrentProcessId,
+    };
+
+    let mut id = 0;
+    // SAFETY: The output pointer is valid; query only this process's session.
+    if unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut id) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut identity = b"windows\0".to_vec();
+    identity.extend_from_slice(&id.to_le_bytes());
+    Ok(identity)
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn lock_identity() -> std::io::Result<Vec<u8>> {
+    Ok(b"unsupported".to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wayland_and_xwayland_environment_variants_share_the_session_lock() {
+        use std::ffi::OsStr;
+
+        let runtime = OsStr::new("/run/user/1000");
+        let wayland = super::linux_lock_identity(
+            true,
+            Some(runtime),
+            Some(OsStr::new("wayland-0")),
+            None,
+            Some(OsStr::new("2")),
+        );
+        let xwayland =
+            super::linux_lock_identity(true, Some(runtime), None, Some(OsStr::new(":0.0")), None);
+        assert_eq!(wayland, xwayland);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn x11_screen_and_local_socket_aliases_share_the_lock() {
+        use std::ffi::OsStr;
+
+        let display = |value| super::x11_display_identity(OsStr::new(value));
+        assert_eq!(display(":0"), display(":0.0"));
+        assert_eq!(display(":0"), display("unix:0"));
+    }
+
+    fn fixture() -> (tempfile::TempDir, YapfastWindow, Rc<RefCell<Adapter>>) {
+        i_slint_backend_testing::init_no_event_loop();
+        let directory = tempfile::tempdir().unwrap();
+        let window = YapfastWindow::new().unwrap();
+        let adapter = Adapter::new(
+            Arc::new(BackgroundRuntime::new().unwrap()),
+            directory.path().into(),
+            &window,
+        )
+        .unwrap();
+        bind(&window, &adapter);
+        (directory, window, adapter)
+    }
+
+    fn chord(scancode: u32, modifiers: ModifierMask) -> Chord {
+        Chord {
+            key: crate::push_to_talk::Keybind {
+                scancode,
+                name: format!("key {scancode}"),
+                trigger: None,
+            },
+            modifiers,
+        }
+    }
+
+    #[test]
+    fn command_bindings_persist_and_conflicts_preserve_both_keys() {
+        let (directory, _, adapter) = fixture();
+        let stored = chord(47, ModifierMask::CTRL | ModifierMask::SHIFT);
+        let occupied = chord(45, ModifierMask::ALT);
+        {
+            let mut adapter = adapter.borrow_mut();
+            adapter.layout.leave_voice_key = Some(occupied.clone());
+            adapter.layout.write(directory.path());
+            assert_eq!(
+                adapter.store_command_key(Binding::ToggleStream, Some(stored.clone())),
+                None
+            );
+        }
+        let persisted = Layout::read(directory.path());
+        assert_eq!(persisted.toggle_stream_key, Some(stored.clone()));
+        assert_eq!(persisted.leave_voice_key, Some(occupied.clone()));
+
+        assert_eq!(
+            adapter
+                .borrow_mut()
+                .store_command_key(Binding::ToggleStream, Some(occupied.clone())),
+            Some("That shortcut already controls the other voice action.")
+        );
+        let persisted = Layout::read(directory.path());
+        assert_eq!(persisted.toggle_stream_key, Some(stored));
+        assert_eq!(persisted.leave_voice_key, Some(occupied));
+    }
+
+    #[test]
+    fn leaving_settings_cancels_an_in_progress_hotkey_recording() {
+        let (directory, window, adapter) = fixture();
+        window.show().unwrap();
+        let original = chord(47, ModifierMask::CTRL);
+        adapter.borrow_mut().layout.toggle_stream_key = Some(original.clone());
+        adapter.borrow().layout.write(directory.path());
+
+        window.set_settings_open(true);
+        window.set_settings_section(1);
+        window.invoke_record_hotkey(1);
+        assert_eq!(window.get_hotkey_recording(), 1);
+        assert!(adapter.borrow().hotkeys.recording);
+
+        let mut recorder = Recorder {
+            pending: Some((Binding::ToggleStream, chord(45, ModifierMask::ALT))),
+            ..Recorder::default()
+        };
+        window
+            .window()
+            .dispatch_event(slint::platform::WindowEvent::KeyPressed {
+                text: slint::platform::Key::Escape.into(),
+            });
+
+        assert!(!window.get_settings_open());
+        assert_eq!(window.get_hotkey_recording(), 0);
+        assert!(!adapter.borrow().hotkeys.recording);
+        assert!(!recorder.event(
+            &WindowEvent::RedrawRequested,
+            &window,
+            &Rc::downgrade(&adapter)
+        ));
+        assert!(recorder.pending.is_none());
+        assert_eq!(
+            Layout::read(directory.path()).toggle_stream_key,
+            Some(original)
+        );
+    }
+
+    #[test]
+    fn stopping_replaced_hotkeys_invalidates_queued_commands() {
+        let (_, _, adapter) = fixture();
+        {
+            let mut adapter = adapter.borrow_mut();
+            adapter.hotkeys.generation = 41;
+            adapter.hotkeys.enabled = true;
+        }
+        assert!(adapter.borrow().hotkey_current(41));
+
+        adapter.borrow_mut().stop_hotkeys();
+        adapter.borrow_mut().hotkeys.enabled = true;
+        assert!(!adapter.borrow().hotkey_current(41));
+        assert!(adapter.borrow().hotkey_current(42));
+    }
 }

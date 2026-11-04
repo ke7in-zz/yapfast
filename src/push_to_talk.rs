@@ -356,6 +356,15 @@ mod matcher;
 #[cfg(target_os = "linux")]
 #[path = "push_to_talk/linux.rs"]
 mod linux;
+#[cfg(target_os = "linux")]
+pub(crate) fn wayland_session() -> bool {
+    linux::is_wayland_session()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn wayland_session() -> bool {
+    false
+}
 
 #[cfg(windows)]
 #[path = "push_to_talk/windows.rs"]
@@ -365,11 +374,6 @@ mod windows;
 pub fn windows_custom_application_handler()
 -> impl slint::winit_030::CustomApplicationHandler + 'static {
     windows::custom_application_handler()
-}
-
-#[cfg(windows)]
-pub fn windows_message_hook() -> impl FnMut(*const std::ffi::c_void) -> bool + 'static {
-    windows::message_hook()
 }
 
 #[cfg(windows)]
@@ -497,14 +501,14 @@ impl Reach {
             }
             Reach::Everywhere(None) => "Available in every app.".into(),
             Reach::Everywhere(Some(shortcut)) if shortcut.is_empty() => {
-                "Your desktop hasn't allowed this shortcut yet. Approve it in your system's global shortcuts settings.".into()
+                "Your desktop accepted this shortcut but didn't report its key.".into()
             }
             Reach::Everywhere(Some(shortcut)) => {
                 format!("Your desktop assigned {shortcut} for this shortcut.")
             }
-            Reach::Focused(why) => format!(
-                "{why}, so push to talk works only while Yapfast's window is in front."
-            ),
+            Reach::Focused(why) => {
+                format!("{why}, so push to talk works only while Yapfast's window is in front.")
+            }
             Reach::Unavailable(why) => why.to_string(),
         }
     }
