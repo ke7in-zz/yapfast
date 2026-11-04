@@ -6,9 +6,10 @@ Three Nix shells cover the work:
 
 - `nix develop path:./nix` is the development shell. Run every `cargo` command
   in it, as `nix develop path:./nix --command cargo ...`. It also provides
-  `bun` for the fake Discord.
+  `bun` for the fake Discord and FFmpeg (`ffmpeg` and `ffprobe`) for its media
+  fixtures.
 - `nix-shell --impure testing/display/shell.nix` adds Weston,
-  PulseAudio, the ALSA plugins and FFmpeg to it, for the private display that
+  PulseAudio and the ALSA plugins to it, for the private display that
   `scripts/ui-session` starts.
 - `nix develop path:./nix#windows` cross-builds for Windows; see the
   [Windows beta guide](windows-beta.md).
