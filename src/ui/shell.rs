@@ -326,6 +326,33 @@ impl Shell {
     }
 }
 
+/// Native command delivery does not retain or create a YapfastWindow.
+pub(super) fn hotkey(command: crate::push_to_talk::Command, generation: u64) {
+    let Some(shell) = SHELL.with(|shell| shell.borrow().upgrade()) else {
+        return;
+    };
+    if !shell.adapter.borrow().hotkey_current(generation) {
+        return;
+    }
+    let command = match command {
+        crate::push_to_talk::Command::ToggleStream => voice::Command::ToggleGameStream,
+        crate::push_to_talk::Command::LeaveVoice => voice::Command::Leave,
+    };
+    shell.act(Action::Voice(command));
+}
+
+pub(super) fn hotkey_status(generation: u64) {
+    let Some(shell) = SHELL.with(|shell| shell.borrow().upgrade()) else {
+        return;
+    };
+    let adapter = shell.adapter.borrow();
+    if adapter.hotkey_generation() == generation
+        && let Some(window) = shell.window()
+    {
+        adapter.show_hotkeys(&window);
+    }
+}
+
 /// Makes the window again where it was, on Appearance as the setting that
 /// asked for it, for a change Slint can't make to the shown window.
 pub(super) fn remake_window() {
@@ -415,6 +442,7 @@ impl Adapter {
             dialog.abort();
         }
         self.window = slint::Weak::default();
+        self.recording_hotkey(false);
     }
 
     /// Rings for a DM call that rings this account, except in Do Not Disturb,

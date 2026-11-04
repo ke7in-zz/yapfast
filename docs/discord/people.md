@@ -447,9 +447,16 @@ Settings → Game activity → Share the game you play is the account's own
 `show_current_game` setting, which Discord's apps change too. Yapfast reads
 it from READY and settings updates and writes it with
 `PATCH /users/@me/settings-proto/1`; it's on unless the account turned it
-off, and a newly linked account shares nothing until READY says. While it's
-off, nothing scans processes, downloads the game list or serves the RPC
-socket.
+off. While off, the periodic detector doesn't scan processes or download
+the game list or serve the RPC socket. An explicit game-stream-toggle press
+is the one exception: it makes a single fresh local scan even while this
+setting is off.
+That scan uses only the already cached Discord game list, this device's custom
+games and installed Steam manifests; it never downloads or refreshes the list
+and does not start the periodic detector or RPC socket. The result stays
+local: process IDs and executable identities are not sent to Discord, added
+to presence or voice snapshots, or logged. `YAPFAST_DISCORD_GAME_DETECTION=0`
+and the test-server fixture-isolation rule still disable the scan.
 
 Every 15 seconds (half a second against the test server, for tests) a
 blocking task lists this user's processes with

@@ -1008,7 +1008,10 @@ export component YapfastWindow inherits Window {
     // Closing settings stops linking Discord there.
     changed settings-open => {
         if !self.settings-open && self.link-phase != 0 { self.cancel-discord-link(); }
-        if !self.settings-open { self.camera-testing = false; }
+        if !self.settings-open {
+            self.camera-testing = false;
+            self.cancel-key-recording();
+        }
         if !self.settings-open && self.theme-editor { self.cancel-theme(); }
     }
     in-out property <int> settings-section;
@@ -1042,6 +1045,25 @@ export component YapfastWindow inherits Window {
     in-out property <int> talk-delay: 20;
     in-out property <string> talk-note;
     callback record-talk-key(bool);
+    in property <string> toggle-stream-key;
+    in property <string> leave-voice-key;
+    in property <string> toggle-stream-note;
+    in property <string> leave-voice-note;
+    in-out property <int> hotkey-recording;
+    in property <bool> hotkeys-desktop;
+    callback record-hotkey(int);
+    callback clear-hotkey(int);
+    callback configure-hotkeys;
+    function cancel-key-recording() {
+        if root.hotkey-recording != 0 {
+            root.hotkey-recording = 0;
+            root.record-hotkey(0);
+        }
+        if root.talk-recording {
+            root.talk-recording = false;
+            root.record-talk-key(false);
+        }
+    }
     /// Calls' microphone and speakers volume: see VoiceSettings.
     in-out property <int> microphone-volume: 100;
     in-out property <int> speaker-volume: 100;
@@ -1107,7 +1129,10 @@ export component YapfastWindow inherits Window {
     callback save-theme();
     callback cancel-theme();
     callback delete-theme();
-    changed settings-section => { if root.theme-editor && root.settings-section != 7 { root.cancel-theme(); } }
+    changed settings-section => {
+        if root.theme-editor && root.settings-section != 7 { root.cancel-theme(); }
+        if root.settings-section != 1 { root.cancel-key-recording(); }
+    }
     out property <length> message-font-size: root.text-size == 0 ? 14px : root.text-size == 2 ? 18px : 16px;
     // The sidebar keeps 180 to 380px. Dragging also leaves the conversation 420px;
     // the window width cannot enter this binding, because it depends on the layout.
@@ -3375,6 +3400,9 @@ export component YapfastWindow inherits Window {
             sensitivity <=> root.sensitivity; gate-level: root.gate-level; gate-sending: root.gate-sending; gate-meter-note: root.gate-meter-note;
             input-mode <=> root.input-mode; talk-key: root.talk-key; talk-recording <=> root.talk-recording;
             talk-delay <=> root.talk-delay; talk-note: root.talk-note;
+            toggle-stream-key: root.toggle-stream-key; leave-voice-key: root.leave-voice-key;
+            toggle-stream-note: root.toggle-stream-note; leave-voice-note: root.leave-voice-note;
+            hotkey-recording: root.hotkey-recording; hotkeys-desktop: root.hotkeys-desktop;
             microphone-volume <=> root.microphone-volume; speaker-volume <=> root.speaker-volume;
             soundboard-volume <=> root.soundboard-volume; entrance-servers: root.entrance-servers;
             entrance-server <=> root.entrance-server; entrance-sound: root.entrance-sound;
@@ -3385,6 +3413,9 @@ export component YapfastWindow inherits Window {
             choose-entrance-sound(id) => { root.choose-entrance-sound(id); }
             call-volumes-changed => { root.call-volumes-changed(); }
             record-talk-key(on) => { root.record-talk-key(on); }
+            record-hotkey(which) => { root.record-hotkey(which); }
+            clear-hotkey(which) => { root.clear-hotkey(which); }
+            configure-hotkeys => { root.configure-hotkeys(); }
             select-microphone(index) => { root.select-microphone(index); }
             select-speaker(index) => { root.select-speaker(index); }
             select-camera(index) => { root.select-camera(index); }

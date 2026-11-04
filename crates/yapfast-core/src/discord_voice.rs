@@ -28,8 +28,8 @@ use crate::{
 /// worker sends one each second while the stream is live.
 const SENDING_STALE: Duration = Duration::from_secs(3);
 
-/// Going live: the worker capturing the screen, then the stream Discord
-/// started for it.
+/// Going live: the worker capturing a source, then the stream Discord
+/// starts for it.
 struct Share {
     worker: Worker,
     reports: mpsc::UnboundedReceiver<Report>,
@@ -41,14 +41,21 @@ struct Share {
 }
 
 impl Share {
-    /// Starts the worker; Discord hears of the stream once there's something
-    /// to show, so a cancelled dialog shares nothing.
-    fn start(state: &mut State, quality: StreamQuality) -> Result<Self> {
-        // Tests and screenshots share colour bars instead of a screen.
-        let source = if std::env::var_os("YAPFAST_STREAM_TEST_PATTERN").is_some() {
+    /// Starts the worker; Discord hears of the stream once frames flow, so a
+    /// cancelled dialog or failed game capture shares nothing.
+    fn start(
+        state: &mut State,
+        quality: StreamQuality,
+        source: stream_worker::Source,
+    ) -> Result<Self> {
+        // Tests and screenshots share colour bars instead of a screen. A
+        // game source remains intact so recognition and identity checks run.
+        let source = if std::env::var_os("YAPFAST_STREAM_TEST_PATTERN").is_some()
+            && !matches!(&source, stream_worker::Source::Game(_))
+        {
             stream_worker::Source::TestPattern
         } else {
-            stream_worker::Source::Screen
+            source
         };
         let (worker, frames, reports) = Worker::share(source, quality)?;
         state.sharing = Some(Sharing {
@@ -123,6 +130,17 @@ type Starting = Option<Pin<Box<dyn Future<Output = Result<StreamServer>>>>>;
 async fn started(starting: &mut Starting) -> Result<StreamServer> {
     match starting {
         Some(starting) => starting.await,
+        None => std::future::pending().await,
+    }
+}
+/// A fresh game scan, or pending until the user asks for one.
+type Finding = Option<
+    Pin<Box<dyn Future<Output = Result<Vec<yapfast_discord::game_detection::GameProcess>>>>>,
+>;
+
+async fn found(finding: &mut Finding) -> Result<Vec<yapfast_discord::game_detection::GameProcess>> {
+    match finding {
+        Some(finding) => finding.await,
         None => std::future::pending().await,
     }
 }
@@ -370,6 +388,7 @@ pub(crate) async fn call(
     let mut cameras = Cameras::start(call.video_frames());
     let mut share: Option<Share> = None;
     let mut starting: Starting = None;
+    let mut finding: Finding = None;
     let mut watch: Option<Watch> = None;
     // Ringing the others while they haven't come, with the ringback heard meanwhile.
     let mut ringing: Ringing = None;
@@ -523,6 +542,8 @@ pub(crate) async fn call(
                     .and_then(|started| started.inspect_err(|error| tracing::warn!(%error, "could not play the ringback")).ok());
             }
             tokio::select! {
+                // A queued Leave/Stop wins over a scan that just became ready.
+                biased;
                 command = commands.recv() => {
                     match command {
                         None | Some(Command::Leave) => break,
@@ -606,15 +627,40 @@ pub(crate) async fn call(
                             state.camera_phase = CameraPhase::Off;
                         }
                         Some(Command::GoLive(quality)) => {
+                            finding = None;
                             if share.is_none() {
                                 state.quality = quality;
                                 Chosen::write(remembered, state);
-                                match Share::start(state, quality) {
+                                match Share::start(state, quality, stream_worker::Source::Screen) {
                                     Ok(started) => {
                                         share = Some(started);
                                         state.error = None;
                                     }
                                     Err(error) => state.error = Some(format!("{error:#}")),
+                                }
+                            }
+                        }
+                        Some(Command::ToggleGameStream) => {
+                            if let Some(stopped) = share.take() {
+                                stopped.stop(discord, state);
+                                starting = None;
+                                finding = None;
+                                state.error = None;
+                            } else if finding.is_some() {
+                                finding = None;
+                                state.error = None;
+                            } else {
+                                match stream_worker::game_capture() {
+                                    Ok(()) => {
+                                        state.error = None;
+                                        finding = Some(Box::pin(async {
+                                            tokio::task::spawn_blocking(
+                                                yapfast_discord::game_detection::running,
+                                            )
+                                            .await?
+                                        }));
+                                    }
+                                    Err(error) => state.error = Some(error.into()),
                                 }
                             }
                         }
@@ -633,6 +679,7 @@ pub(crate) async fn call(
                                 stopped.stop(discord, state);
                             }
                             starting = None;
+                            finding = None;
                         }
                         Some(Command::Watch(user)) => {
                             let watching = state.watching.as_ref().is_some_and(|watching| watching.user == user);
@@ -690,6 +737,27 @@ pub(crate) async fn call(
                         Some(Command::LeaveStale) => {}
                     }
                     discord.set_self(guild, &channel, state.muted, state.deafened, state.camera_phase == CameraPhase::On);
+                    snapshots.send_replace(state.clone());
+                }
+                result = found(&mut finding) => {
+                    finding = None;
+                    match result {
+                        Ok(_) if share.is_some() => {}
+                        Ok(games) if games.is_empty() => {
+                            state.error = Some("No running game was recognized.".into());
+                        }
+                        Ok(games) => {
+                            let quality = state.quality;
+                            match Share::start(state, quality, stream_worker::Source::Game(games)) {
+                                Ok(started) => {
+                                    share = Some(started);
+                                    state.error = None;
+                                }
+                                Err(error) => state.error = Some(format!("{error:#}")),
+                            }
+                        }
+                        Err(error) => state.error = Some(format!("{error:#}")),
+                    }
                     snapshots.send_replace(state.clone());
                 }
                 result = camera::opened(&mut opening) => {

@@ -53,6 +53,39 @@ gives a frame, it replaces the first. If the dialog is cancelled, the first
 one goes on. The encoder takes the new size on the same connection.
 `YAPFAST_STREAM_TEST_PATTERN=1` shares moving colour bars instead of a screen.
 
+## Game-stream toggle
+
+The game-stream shortcut is separate from the normal Go Live controls. When
+no stream is active, a press checks whether automatic targeting is available,
+then makes one fresh local scan using recognized Discord catalog entries,
+custom games and installed Steam manifests. It uses the cached catalog only:
+the shortcut never downloads a game list. If no running process is recognized,
+it reports that and opens no picker. The account's `show_current_game`
+presence setting does not gate this explicit scan; the periodic presence
+detector and its privacy behavior are otherwise unchanged. Process identities
+stay local to Yapfast and its stream worker and are not sent to Discord.
+
+The stream worker selects only a capturable window owned by one of those still
+running process identities: Windows checks each HWND's process, and native X11
+checks each XID with the X-Resource extension's local-client PID. It never
+chooses the foreground window, uses a window title or trusts `_NET_WM_PID`.
+The foremost capturable window belonging to a recognized game is tried first.
+If the process exits, its identity changes, the window is not capturable, or X-Resource
+cannot identify it, starting fails rather than switching to the screen, a
+picker, or the previously selected source. Minimized, untitled, unresponsive,
+exclusive-fullscreen or otherwise unsupported windows may not be capturable;
+Yapfast reports the native capture failure instead of bypassing it.
+
+Automatic game-window starting is available on Windows and native X11. On
+Wayland it is explicitly unavailable because the portal cannot verify which
+process owns the chosen window; the shortcut does not open the portal. macOS
+game-window starting is also unavailable. On every platform the same shortcut
+stops an active stream even if no game is recognized or capture is unavailable;
+Leave continues to end a call normally. `YAPFAST_STREAM_TEST_PATTERN=1` replaces
+the frames only after a recognized process identity is found and still running;
+it does not bypass the no-game guard. Stream audio remains the existing mixed
+audio from other applications, not game-only audio.
+
 A camera can be shared too, such as OBS's virtual camera (v4l2loopback on
 Linux, its DirectShow filter on Windows). The share menu lists the cameras
 [the call's camera](voice.md#camera-video) lists, under CAMERAS, after the

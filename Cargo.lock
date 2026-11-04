@@ -11566,6 +11566,7 @@ dependencies = [
  "skia-safe",
  "slint",
  "tempfile",
+ "tokio",
  "tracing",
  "wayland-backend",
  "wayland-client",
@@ -11629,6 +11630,7 @@ dependencies = [
  "webrtc-sys-build",
  "windows",
  "windows-core",
+ "x11rb",
  "x264-src",
  "yapfast-discord",
 ]

@@ -100,9 +100,14 @@ GOATed GIF loads.
 
 Voice channels and DM calls, with mute, deafen, a volume for each person,
 noise suppression, echo removal, and a voice gate you can tune, or
-push-to-talk on any key you like, held in any app. Go Live, watch other
+push-to-talk on any key you like, with background input where your desktop
+supports it. Go Live, watch other
 people's streams, turn on your camera and play the soundboard. The call
 stays up while you read other channels.
+
+Set optional global voice shortcuts to toggle a recognized game's stream or
+leave your call without opening Yapfast. [Voice shortcuts](docs/discord/voice.md#global-voice-shortcuts)
+explains background support, permissions and the Wayland game-capture limit.
 
 The noise suppression could be better, though. Know an open source one that
 does a better job? PLEASE tell me.

@@ -486,21 +486,58 @@ account, leave it out. `matrix_voice`'s
 `persistent_encrypted_voice_and_native_audio` checks it between two processes
 on the local stack.
 
-`src/push_to_talk.rs` hears the key in other apps where the desktop lets it:
+## Global voice shortcuts
 
-| Desktop | How | Checked |
-| --- | --- | --- |
-| Wayland | The xdg-desktop-portal GlobalShortcuts portal: Yapfast binds one shortcut, offering the key as its preferred trigger, and holds it from Activated to Deactivated. The desktop may ask to approve it or give it another key; settings show the shortcut it gave. KDE Plasma, Hyprland and GNOME from 48 have the portal | Against a stand-in portal on a private bus (`the_portal_binds_the_key_and_holds_it`); not on a real desktop |
-| X11 | XInput 2's raw key events on the root window, which come whatever window has the focus and leave the key to it | Under Xvfb, with xdotool typing (`x11_hears_the_key_whatever_has_the_focus`) |
-| Windows | A low-level keyboard hook (`WH_KEYBOARD_LL`) on a thread of its own, which sees the key's release, unlike `RegisterHotKey`, and passes every key on | Under Wine 10.0, with `SendInput` typing (`the_hook_hears_the_key_go_down_and_up`); not on real Windows, where Windows may keep keys typed into a program running as administrator, such as some games, from the hook, as Discord warns of its own |
+Settings → Voice & video has optional **Toggle game stream** and **Leave voice
+channel** shortcuts, with no defaults. Hold any modifiers, then press and
+release the main key to record a chord. Escape, Cancel, losing focus, closing
+Settings or leaving Voice & video keeps the previous binding. Duplicate voice
+chords and chords overlapping push to talk are rejected without clearing it.
 
-Where none of these works, as on a wlroots desktop such as Sway, which has no
-GlobalShortcuts, the window's own key events stand in, so the key works while
-Yapfast is in front, and settings say so, as Discord's browser client does.
-Losing the focus lets the key go. The watcher runs while push to talk is on and
-a key is set, in calls or not, and with the window closed to the tray: a thread
-blocked on the X server or in the hook's message loop, or the portal's task on
-the network runtime. The ignored tests above, and
-`push_to_talk_sends_only_while_the_key_is_held` against the fake Discord, which
-checks that beeps with the key up send nothing and with it held do, run by
-hand; see their comments for what each needs.
+Toggle starts only a recognized running game's own window on Windows or
+native X11, including games found through Steam. It never substitutes the
+foreground app, a monitor, an old source or a picker. If a stream is already
+running, it stops it instead; a second press while starting cancels the start.
+Stopping does not need a game to remain running. Audio includes sound from
+other applications, not just the game. See [Go Live](go-live.md) for game
+recognition and capture details.
+
+Automatic game-window targeting is unavailable on Wayland. The same shortcut
+can still stop an existing stream there, including one started through the
+normal Go Live controls; it cannot start a game stream.
+
+Leave disconnects the current local call immediately, without a confirmation
+or bringing the window forward. With no current call, either shortcut does
+nothing. Each command fires once per press, not on keyboard repeat, and is
+independent of push to talk.
+
+`src/push_to_talk.rs` shares one native input source for the configured
+bindings. Desktop policy still applies: permissions, reserved shortcuts,
+secure desktops and session locks cannot be overridden.
+
+| Desktop | Backend and limits |
+| --- | --- |
+| Wayland | One xdg-desktop-portal GlobalShortcuts session binds the configured action IDs, offering preferred triggers. Settings show actual grants and desktop-assigned keys, not an assumed assignment. Activated/Deactivated hold PTT and delimit command presses. The live desktop editor requires portal version 2; version 1 still supports the shortcuts, with assignments managed by the desktop. A desktop without GlobalShortcuts has no background command support. |
+| X11 | XInput 2.1 raw key events on the root window, including while another client holds a keyboard grab. Keys also reach the focused app. Initial held keys and device changes are synchronized without synthesizing command presses. |
+| Windows | Commands use Winit's application-lifetime Raw Input receiver with `RIDEV_INPUTSINK`, including with no Yapfast window. PTT retains its separate `WH_KEYBOARD_LL` hook. Session, desktop and suspend notifications clear stale keys; commands are unavailable if their required registrations fail. The original keyboard registration is restored on teardown. |
+
+When background input is unavailable, only PTT can fall back to focused-window
+events; settings say it is focused-only and losing focus releases it.
+Command chords never use a focused-only fallback.
+
+The watcher belongs to the application, not a window or selected channel, and
+routes commands to the current call while minimized or closed to the tray.
+Recording suppresses commands until it ends. Rebinding replaces the old
+watcher; stale queued callbacks cannot execute through the replacement.
+Only one instance per OS user and desktop session owns command delivery, even
+when another instance uses a different data directory. Losing the portal
+service clears its grants and held keys before reconnecting; an explicit
+permission denial does not repeatedly prompt.
+
+`x11_delivers_chords_and_ptt_without_consuming_the_key` exercises a separate
+client's keyboard grab on a private X server.
+`one_portal_session_binds_all_ids_and_emits_command_edges` exercises PTT,
+command edge deduplication and the version-1 editor limit on a private bus.
+Both ignored tests require their documented private environments.
+`push_to_talk_sends_only_while_the_key_is_held` against the fake Discord checks
+that beeps with the key up send nothing and with it held do.

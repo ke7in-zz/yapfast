@@ -45,6 +45,7 @@ mod callbacks;
 mod channel_settings;
 mod games;
 mod gifs;
+mod hotkeys;
 mod menus;
 mod messages;
 #[cfg(windows)]
@@ -93,6 +94,31 @@ pub fn run(
     background: bool,
     open_link: Option<String>,
 ) -> Result<Exit> {
+    let result = run_inner(
+        runtime,
+        root,
+        preview,
+        renderer,
+        gpu_failure,
+        background,
+        open_link,
+    );
+    #[cfg(windows)]
+    if !crate::push_to_talk::windows_teardown() {
+        anyhow::bail!("Windows could not release Yapfast's background keyboard registration.");
+    }
+    result
+}
+
+fn run_inner(
+    runtime: BackgroundRuntime,
+    root: PathBuf,
+    preview: bool,
+    renderer: Option<graphics::Renderer>,
+    gpu_failure: Option<String>,
+    background: bool,
+    open_link: Option<String>,
+) -> Result<Exit> {
     let (plan, placement, system_title_bar, mut instance) = {
         let mut layout = Layout::read(&root);
         let instance = if preview {
@@ -122,6 +148,19 @@ pub fn run(
     // failed GPU surface; Yapfast owns the fallback and tells the user about it.
     // Windows draws the GPU setting with Direct3D 12; see [`graphics`].
     let selector = slint::BackendSelector::new().backend_name("winit".into());
+    #[cfg(windows)]
+    let selector = {
+        use slint::winit_030::winit::{
+            event_loop::EventLoop, platform::windows::EventLoopBuilderExtWindows,
+        };
+        let mut events = EventLoop::<slint::winit_030::SlintEvent>::with_user_event();
+        events.with_msg_hook(crate::push_to_talk::windows_message_hook());
+        selector
+            .with_winit_event_loop_builder(events)
+            .with_winit_custom_application_handler(
+                crate::push_to_talk::windows_custom_application_handler(),
+            )
+    };
     let (selector, renderer) = match plan.renderer {
         graphics::Renderer::Gpu if cfg!(windows) => (
             selector.renderer_name("skia".into()).require_d3d(),
@@ -183,7 +222,8 @@ pub fn run(
     bind_callbacks(&window, &adapter);
     watch_window(&window, &adapter);
     adapter.borrow_mut().watch_away();
-    adapter.borrow_mut().watch_talk_key(&window);
+    adapter.borrow_mut().watch_hotkeys();
+    adapter.borrow().show_hotkeys(&window);
     adapter.borrow().show_protocol(&window);
     if !preview {
         adapter.borrow_mut().pending_link = open_link;
@@ -235,6 +275,7 @@ pub fn run(
     placement::flush(&adapter);
     // The icon goes before Yapfast does, not when Windows next looks at it.
     adapter.tray = None;
+    adapter.stop_hotkeys();
     adapter.stop_backend();
     // A window made late, as from the tray after starting in it, failed on the GPU.
     if result.is_ok()
@@ -336,6 +377,7 @@ fn watch_window(window: &YapfastWindow, adapter: &Rc<RefCell<Adapter>>) {
         zoom::apply(window.window(), base.get(), level.get());
         let note = Rc::new(slint::Timer::default());
         let mut keys = zoom::Keys::default();
+        let mut hotkey_recorder = hotkeys::Recorder::default();
         // The winit window exists by the first event it sends.
         #[cfg(target_os = "linux")]
         let mut watching = false;
@@ -477,6 +519,11 @@ fn watch_window(window: &YapfastWindow, adapter: &Rc<RefCell<Adapter>>) {
                     });
                 }
                 crate::push_to_talk::window_event(event);
+                if let Some(window) = weak.upgrade()
+                    && hotkey_recorder.event(event, &window, &adapter)
+                {
+                    return EventResult::PreventDefault;
+                }
                 // While recording the push-to-talk key, the next key becomes
                 // it, and Escape stops; either way only the recorder sees it.
                 if let WindowEvent::KeyboardInput { event: key, .. } = event
@@ -486,6 +533,12 @@ fn watch_window(window: &YapfastWindow, adapter: &Rc<RefCell<Adapter>>) {
                 {
                     if !key.repeat {
                         window.set_talk_recording(false);
+                        let state = adapter.clone();
+                        slint::Timer::single_shot(Duration::ZERO, move || {
+                            if let Some(adapter) = state.upgrade() {
+                                adapter.borrow_mut().recording_hotkey(false);
+                            }
+                        });
                         let recorded = (key.logical_key != Key::Named(NamedKey::Escape))
                             .then(|| crate::push_to_talk::Keybind::recorded(key))
                             .flatten();
@@ -990,6 +1043,9 @@ struct Layout {
     input_mode: InputMode,
     push_to_talk_key: Option<crate::push_to_talk::Keybind>,
     push_to_talk_release_delay: Option<u32>,
+    /// Global commands are independent of the microphone's input mode.
+    toggle_stream_key: Option<crate::push_to_talk::Chord>,
+    leave_voice_key: Option<crate::push_to_talk::Chord>,
     /// How loud every call sends the microphone and plays, as sliders'
     /// percentages from 0% to 200%; 100% unless changed.
     microphone_volume: Option<u8>,
@@ -1660,9 +1716,8 @@ struct Adapter {
     /// show the voice gate's sensitivity.
     #[cfg(feature = "discord")]
     gate_meter: Option<yapfast_core::discord_audio::GateMeter>,
-    /// Watches the push-to-talk key while push to talk is on and it's set,
-    /// with or without the window.
-    talk_key: Option<crate::push_to_talk::Watcher>,
+    /// Input and command ownership survive destruction of the window.
+    hotkeys: hotkeys::Keys,
     /// Previews of the pictures waiting in the composer, by file; `None` while
     /// one is read, or when it can't be.
     thumbnails: HashMap<PathBuf, Option<pictures::Thumbnail>>,
@@ -1851,7 +1906,7 @@ impl Adapter {
                 watched: None,
                 #[cfg(feature = "discord")]
                 gate_meter: None,
-                talk_key: None,
+                hotkeys: hotkeys::Keys::default(),
                 thumbnails: HashMap::new(),
                 pasted: None,
                 drag_over: false,
@@ -1870,42 +1925,26 @@ impl Adapter {
         }))
     }
 
-    /// Starts, changes or stops watching the push-to-talk key as settings
-    /// say, and shows where it works.
-    fn watch_talk_key(&mut self, window: &YapfastWindow) {
-        let wanted = self
-            .layout
-            .push_to_talk_key
-            .as_ref()
-            .filter(|_| self.layout.input_mode == InputMode::PushToTalk);
-        if self
-            .talk_key
-            .as_ref()
-            .map(crate::push_to_talk::Watcher::key)
-            != wanted
-        {
-            // The old one goes first, ending its portal session.
-            self.talk_key = None;
-            self.talk_key = wanted.cloned().map(|key| {
-                let weak = window.as_weak();
-                crate::push_to_talk::Watcher::start(key, &self.runtime, move |reach| {
-                    let _ = weak.upgrade_in_event_loop(move |window| {
-                        window.set_talk_note(reach.note().into());
-                    });
-                })
-            });
-        }
-        let note = self.talk_key.as_ref().map(|watcher| watcher.reach().note());
-        window.set_talk_note(note.unwrap_or_default().into());
-    }
-
     /// Makes a recorded key the push-to-talk key.
     fn set_talk_key(&mut self, window: &YapfastWindow, key: crate::push_to_talk::Keybind) {
-        tracing::info!(key = key.name, "push-to-talk key recorded");
+        if [
+            self.layout.toggle_stream_key.as_ref(),
+            self.layout.leave_voice_key.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|chord| chord.overlaps_talk(&key))
+        {
+            window.set_talk_note(
+                "That key overlaps a global voice shortcut. Choose another key.".into(),
+            );
+            return;
+        }
         window.set_talk_key(key.name.as_str().into());
         self.layout.push_to_talk_key = Some(key);
         self.layout.write(&self.root);
-        self.watch_talk_key(window);
+        self.watch_hotkeys();
+        self.show_hotkeys(window);
     }
 
     /// Shows whether Discord protocol links open here, as the desktop
@@ -1920,7 +1959,8 @@ impl Adapter {
     fn attach(&mut self, window: &YapfastWindow) {
         self.models.attach(window);
         self.layout.apply(window);
-        self.watch_talk_key(window);
+        self.watch_hotkeys();
+        self.show_hotkeys(window);
         self.show_protocol(window);
         // The theme being edited goes unsaved with the old window, and rows
         // may carry its mention colour; the refresh after attaching builds
@@ -2242,6 +2282,7 @@ impl Adapter {
                 }
             }
         }
+        self.update_hotkey_owner();
     }
 
     /// Starts linking a Discord account, by QR code or with a pasted token,
@@ -2408,6 +2449,7 @@ impl Adapter {
 
 impl Drop for Adapter {
     fn drop(&mut self) {
+        self.stop_hotkeys();
         self.stop_backend();
     }
 }

@@ -2,8 +2,8 @@
 //! identity is refreshed; no CPU, memory, I/O, environment or thread metrics.
 
 use crate::api::Api;
-use anyhow::Result;
-use serde::Serialize;
+use anyhow::{Result, ensure};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, hash_map::DefaultHasher},
@@ -33,14 +33,19 @@ fn interval() -> Duration {
     }
 }
 
+fn disabled(custom: Option<&Path>) -> bool {
+    std::env::var_os("YAPFAST_DISCORD_GAME_DETECTION").is_some_and(|v| v == "0")
+        || (crate::client::test_server().is_some()
+            && custom.is_none()
+            && std::env::var_os("YAPFAST_DISCORD_GAMES_CACHE").is_none())
+        || !sysinfo::IS_SUPPORTED_SYSTEM
+}
+
 pub(crate) fn start(api: Arc<Api>) -> watch::Receiver<Option<Arc<Value>>> {
     let (shown, receiver) = watch::channel(None);
     tokio::spawn(async move {
         let custom = std::env::var_os("YAPFAST_DISCORD_GAMES_FILE").map(PathBuf::from);
-        let isolated_cache = std::env::var_os("YAPFAST_DISCORD_GAMES_CACHE").is_some();
-        let disabled = std::env::var_os("YAPFAST_DISCORD_GAME_DETECTION").is_some_and(|v| v == "0")
-            || (crate::client::test_server().is_some() && custom.is_none() && !isolated_cache);
-        if disabled || !sysinfo::IS_SUPPORTED_SYSTEM {
+        if disabled(custom.as_deref()) {
             shown.closed().await;
             return;
         }
@@ -50,6 +55,68 @@ pub(crate) fn start(api: Arc<Api>) -> watch::Receiver<Option<Arc<Value>>> {
         shown.send_replace(None);
     });
     receiver
+}
+
+/// Finds recognized games in one fresh, local scan. Unlike presence scans,
+/// this doesn't retain a game after its process disappears or fetch a catalog.
+pub fn running() -> Result<Vec<GameProcess>> {
+    let custom = std::env::var_os("YAPFAST_DISCORD_GAMES_FILE").map(PathBuf::from);
+    ensure!(!disabled(custom.as_deref()), "game detection is off");
+    let cache = std::env::var_os("YAPFAST_DISCORD_GAMES_CACHE")
+        .map(PathBuf::from)
+        .or_else(crate::cache::games_file);
+    let path = custom.as_ref().or(cache.as_ref());
+    let catalog = path
+        .and_then(|path| match Catalog::read(path) {
+            Ok(catalog) => Some(catalog),
+            Err(error) => {
+                tracing::debug!(%error, "no cached game catalogue");
+                None
+            }
+        })
+        .unwrap_or_default();
+    let mut custom_games = custom_games::subscribe();
+    Ok(fresh_running(
+        catalog,
+        steam::roots(),
+        &custom_games.borrow_and_update(),
+    ))
+}
+
+fn fresh_running(
+    catalog: Catalog,
+    roots: Vec<PathBuf>,
+    games: &[custom_games::CustomGame],
+) -> Vec<GameProcess> {
+    let mut detector = Detector::new(catalog, roots);
+    detector.set_executables(games);
+    detector.refresh();
+    detector.running_games()
+}
+
+/// Whether this exact process identity still exists, without presence's
+/// two-scan grace period.
+pub fn still_running(process: GameProcess) -> bool {
+    let pid = sysinfo::Pid::from_u32(process.pid);
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        false,
+        ProcessRefreshKind::nothing()
+            .without_tasks()
+            .with_exe(UpdateKind::Always),
+    );
+    system.process(pid).is_some_and(|found| {
+        found.start_time() == process.started && fingerprint(found) == process.fingerprint
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GameProcess {
+    pub pid: u32,
+    pub started: u64,
+    /// Hash of the executable name and path, used only to reject PID reuse.
+    pub fingerprint: u64,
 }
 
 async fn run(
@@ -126,12 +193,6 @@ async fn run(
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Identity {
-    pid: u32,
-    started: u64,
-}
-
 struct Known {
     started: u64,
     fingerprint: u64,
@@ -140,7 +201,7 @@ struct Known {
 }
 
 struct Found {
-    identity: Identity,
+    process: GameProcess,
     game: Arc<GameInfo>,
 }
 
@@ -166,10 +227,12 @@ impl Selection {
             .into_iter()
             .inspect(|found| {
                 current_found |= self.active.as_ref().is_some_and(|active| {
-                    found.identity == active.found.identity && found.game == active.found.game
+                    found.process.pid == active.found.process.pid
+                        && found.process.started == active.found.process.started
+                        && found.game == active.found.game
                 });
             })
-            .max_by_key(|f| (f.identity.started, f.identity.pid));
+            .max_by_key(|f| (f.process.started, f.process.pid));
         if let Some(active) = &mut self.active {
             if current_found {
                 active.missed = 0;
@@ -182,7 +245,7 @@ impl Selection {
         }
         self.active = next.map(|found| {
             let started = found
-                .identity
+                .process
                 .started
                 .checked_mul(1000)
                 .filter(|t| *t > 0 && *t <= now_ms)
@@ -363,7 +426,7 @@ impl Detector {
         self.selection = Selection::default();
     }
 
-    fn scan(&mut self, now_ms: u64) -> Option<Arc<Value>> {
+    fn refresh(&mut self) {
         if Instant::now() >= self.next_steam {
             if let Some(steam) = steam::Steam::load(&self.steam_roots, &self.catalog, &self.steam) {
                 self.steam = steam;
@@ -505,18 +568,36 @@ impl Detector {
                 },
             );
         }
+    }
+
+    fn scan(&mut self, now_ms: u64) -> Option<Arc<Value>> {
+        self.refresh();
         self.selection.update(
             self.known.iter().filter_map(|(&pid, known)| {
                 known.game.as_ref().map(|game| Found {
-                    identity: Identity {
+                    process: GameProcess {
                         pid,
                         started: known.started,
+                        fingerprint: known.fingerprint,
                     },
                     game: game.clone(),
                 })
             }),
             now_ms,
         )
+    }
+
+    fn running_games(&self) -> Vec<GameProcess> {
+        self.known
+            .iter()
+            .filter_map(|(&pid, known)| {
+                known.game.as_ref().map(|_| GameProcess {
+                    pid,
+                    started: known.started,
+                    fingerprint: known.fingerprint,
+                })
+            })
+            .collect()
     }
 }
 
@@ -606,7 +687,11 @@ mod tests {
 
     fn found(pid: u32, started: u64, name: &str) -> Found {
         Found {
-            identity: Identity { pid, started },
+            process: GameProcess {
+                pid,
+                started,
+                fingerprint: u64::from(pid) ^ started,
+            },
             game: Arc::new(GameInfo {
                 id: Some(42),
                 name: name.into(),
@@ -619,11 +704,11 @@ mod tests {
         let mut state = Selection::default();
         let first = state.update(vec![found(10, 100, "Game")], 300_000).unwrap();
         assert_eq!(first["timestamps"]["start"], 100_000);
+        assert!(first.get("pid").is_none(), "process IDs stay local");
+        let mut same_game = found(10, 100, "Game");
+        same_game.process.fingerprint ^= 1;
         let unchanged = state
-            .update(
-                vec![found(10, 100, "Game"), found(20, 200, "Other")],
-                300_000,
-            )
+            .update(vec![same_game, found(20, 200, "Other")], 300_000)
             .unwrap();
         assert!(
             Arc::ptr_eq(&first, &unchanged),
@@ -750,8 +835,34 @@ mod tests {
             detector.scan(crate::service::now_ms()).unwrap()["name"],
             "Native Fixture"
         );
+        let running = fresh_running(
+            Catalog::default(),
+            Vec::new(),
+            &[custom(name, "Fixture Game")],
+        );
+        assert_eq!(running.len(), 1);
+        let process = running[0];
+        assert_eq!(process.pid, child.0.id());
+        assert!(still_running(process));
+        let mut stale_start = process;
+        stale_start.started += 1;
+        assert!(!still_running(stale_start));
+        let mut stale_executable = process;
+        stale_executable.fingerprint ^= 1;
+        assert!(!still_running(stale_executable));
+
         child.0.kill().unwrap();
         child.0.wait().unwrap();
+        assert!(!still_running(process));
+        assert!(
+            fresh_running(
+                Catalog::default(),
+                Vec::new(),
+                &[custom(name, "Fixture Game")],
+            )
+            .is_empty(),
+            "a fresh scan has no grace-stale game"
+        );
         assert!(detector.scan(crate::service::now_ms()).is_some());
         assert!(detector.scan(crate::service::now_ms()).is_none());
     }

@@ -136,6 +136,8 @@ pub enum Source {
     /// A screen or window the person picks in the system's dialog, or what
     /// they picked from [`shareable`] where there's none.
     Screen,
+    /// The foremost capturable window belonging to a recognized running game.
+    Game(Vec<yapfast_discord::game_detection::GameProcess>),
     /// A screen by the id [`shareable`] listed it with.
     Display(u64),
     /// A window by the id [`shareable`] listed it with.
@@ -150,6 +152,35 @@ pub enum Source {
 /// Whether Yapfast lists screens and windows to share itself, where the system
 /// has no dialog to pick one: everywhere but Linux.
 pub const LISTS_SOURCES: bool = cfg!(not(target_os = "linux"));
+/// Whether automatic recognized-game capture is available on this session.
+/// Wayland is deliberately unavailable: its portal cannot identify which
+/// process owns the selected window. The test pattern can replace capture on a
+/// headless Linux test run, but only after a recognized process is validated.
+pub fn game_capture() -> Result<(), &'static str> {
+    #[cfg(windows)]
+    {
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let wayland = std::env::var_os("XDG_SESSION_TYPE")
+            .is_some_and(|session| session.to_string_lossy().eq_ignore_ascii_case("wayland"))
+            || std::env::var_os("WAYLAND_DISPLAY").is_some();
+        if wayland {
+            Err("Automatic game-window sharing is unavailable on Wayland.")
+        } else if std::env::var_os("DISPLAY").is_some_and(|display| !display.is_empty())
+            || std::env::var_os("YAPFAST_STREAM_TEST_PATTERN").is_some()
+        {
+            Ok(())
+        } else {
+            Err("Automatic game-window sharing requires Windows or an X11 session.")
+        }
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        Err("Automatic game-window sharing is unavailable on this system.")
+    }
+}
 
 /// A screen, window or camera [`shareable`] lists.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -374,11 +405,14 @@ fn serve(mut input: Box<dyn BufRead + Send>, report: &mut dyn FnMut(Report)) {
             hardware,
         } => {
             let fps = fps.clamp(1, 60);
+            let pattern = source == Source::TestPattern
+                || (std::env::var_os("YAPFAST_STREAM_TEST_PATTERN").is_some()
+                    && matches!(&source, Source::Game(_)));
             let sink = Sink {
                 writer: Writer::open(&frames)?,
                 controls: received,
                 server: None,
-                sound: source != Source::TestPattern,
+                sound: !pattern,
                 video: None,
                 fps,
                 effort,
@@ -392,6 +426,18 @@ fn serve(mut input: Box<dyn BufRead + Send>, report: &mut dyn FnMut(Report)) {
             report(Report::Ready);
             match source {
                 Source::TestPattern => test_pattern(sink, width, height, &stop, report),
+                Source::Game(processes) if pattern => {
+                    if let Err(error) = game_capture() {
+                        bail!("{error}");
+                    }
+                    if !processes
+                        .iter()
+                        .any(|process| yapfast_discord::game_detection::still_running(*process))
+                    {
+                        bail!("The recognized game is no longer running.");
+                    }
+                    test_pattern(sink, width, height, &stop, report)
+                }
                 source => capture_screen(source, sink, width, height, &stop, report),
             }
         }
@@ -1005,8 +1051,8 @@ fn capture_screen(
 ) -> Result<()> {
     let fps = sink.fps;
     let sink = Arc::new(Mutex::new(sink));
+    let game_source = matches!(&source, Source::Game(_));
     let mut capture = Capture::start(source, &sink, max_width, max_height)?;
-    // A screen, window or camera to share in its place, until it gives a
     // picture.
     let mut switching: Option<Capture> = None;
     let started = Instant::now();
@@ -1021,6 +1067,9 @@ fn capture_screen(
         frame += 1;
         let seen = capture.seen();
         if let Some(failure) = &seen.failed {
+            if game_source {
+                bail!(failure.clone());
+            }
             bail!(if reported.is_none() {
                 "Screen sharing was cancelled, or this desktop has no screen sharing dialog."
                     .to_owned()
@@ -1079,6 +1128,117 @@ struct Capture {
     captured: Arc<Mutex<Captured>>,
 }
 
+#[cfg(any(windows, target_os = "linux"))]
+fn game_window(
+    capturer: &mut livekit::webrtc::desktop_capturer::DesktopCapturer,
+    games: &[yapfast_discord::game_detection::GameProcess],
+) -> Result<livekit::webrtc::desktop_capturer::CaptureSource> {
+    use yapfast_discord::game_detection::still_running;
+
+    if games.is_empty() {
+        bail!("No recognized game process was found.");
+    }
+    #[cfg(target_os = "linux")]
+    let owners = X11WindowOwners::new()?;
+    // Native lists are front-to-back: choose the foremost recognized game's
+    // capturable window, not an unrelated foreground app or newest process.
+    for window in capturer.get_source_list() {
+        let owner = {
+            #[cfg(windows)]
+            {
+                window_owner_pid(window.id())
+            }
+            #[cfg(target_os = "linux")]
+            {
+                owners.pid(window.id())?
+            }
+        };
+        let Some(game) = games.iter().find(|game| Some(game.pid) == owner) else {
+            continue;
+        };
+        if !still_running(*game) {
+            continue;
+        }
+        let still_owned = {
+            #[cfg(windows)]
+            {
+                window_owner_pid(window.id()) == Some(game.pid)
+            }
+            #[cfg(target_os = "linux")]
+            {
+                owners.pid(window.id())? == Some(game.pid)
+            }
+        };
+        if still_owned && still_running(*game) {
+            return Ok(window);
+        }
+    }
+    bail!(
+        "The recognized game has no capturable window owned by its process \
+         (it may be minimized, untitled, unresponsive, or use a separate launcher)."
+    )
+}
+
+#[cfg(windows)]
+fn window_owner_pid(window: u64) -> Option<u32> {
+    use windows::Win32::{Foundation::HWND, UI::WindowsAndMessaging::GetWindowThreadProcessId};
+    let window = HWND(window as usize as *mut _);
+    let mut pid = 0;
+    // SAFETY: the HWND comes from libwebrtc's current capturable-window list;
+    // GetWindowThreadProcessId only reads its owner process.
+    unsafe { GetWindowThreadProcessId(window, Some(&mut pid)) };
+    (pid != 0).then_some(pid)
+}
+
+#[cfg(target_os = "linux")]
+struct X11WindowOwners(x11rb::rust_connection::RustConnection);
+
+#[cfg(target_os = "linux")]
+impl X11WindowOwners {
+    fn new() -> Result<Self> {
+        use x11rb::protocol::res::ConnectionExt;
+        let (connection, _) =
+            x11rb::connect(None).context("Could not connect to X11 to identify game windows.")?;
+        let version = connection
+            .res_query_version(1, 2)
+            .context("The X-Resource extension is required to identify X11 game windows.")?
+            .reply()
+            .context("The X-Resource extension could not be queried.")?;
+        if (version.server_major, version.server_minor) < (1, 2) {
+            bail!("X-Resource 1.2 or newer is required to identify X11 game windows.");
+        }
+        Ok(Self(connection))
+    }
+
+    fn pid(&self, window: u64) -> Result<Option<u32>> {
+        use x11rb::protocol::res::{ClientIdMask, ClientIdSpec, ConnectionExt};
+        let Ok(window) = u32::try_from(window) else {
+            return Ok(None);
+        };
+        let spec = [ClientIdSpec {
+            client: window,
+            mask: ClientIdMask::LOCAL_CLIENT_PID,
+        }];
+        let reply = self
+            .0
+            .res_query_client_ids(&spec)?
+            .reply()
+            .context("X-Resource could not identify the X11 window owner.")?;
+        Ok(reply
+            .ids
+            .into_iter()
+            .find(|id| id.spec.mask.contains(ClientIdMask::LOCAL_CLIENT_PID))
+            .and_then(|id| id.value.into_iter().next()))
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn game_window(
+    _capturer: &mut livekit::webrtc::desktop_capturer::DesktopCapturer,
+    _games: &[yapfast_discord::game_detection::GameProcess],
+) -> Result<livekit::webrtc::desktop_capturer::CaptureSource> {
+    bail!("Automatic game-window sharing is unavailable on this system.")
+}
 impl Capture {
     /// Starts capturing `source`, fitting its frames in `max_width` by
     /// `max_height`; on Linux, a screen or window the system's dialog picks.
@@ -1094,33 +1254,51 @@ impl Capture {
         use livekit::webrtc::desktop_capturer::{
             CaptureError, DesktopCaptureSourceType, DesktopCapturer, DesktopCapturerOptions,
         };
-        // On Linux the system's screen sharing dialog picks a screen or window.
+        let game_source = matches!(&source, Source::Game(_));
+        if game_source && let Err(error) = game_capture() {
+            bail!("{error}");
+        }
         #[cfg(target_os = "linux")]
-        let kind = DesktopCaptureSourceType::Generic;
+        let kind = match &source {
+            Source::Game(_) => DesktopCaptureSourceType::Window,
+            _ => DesktopCaptureSourceType::Generic,
+        };
         #[cfg(not(target_os = "linux"))]
-        let kind = match source {
-            Source::Window(_) => DesktopCaptureSourceType::Window,
+        let kind = match &source {
+            Source::Window(_) | Source::Game(_) => DesktopCaptureSourceType::Window,
             _ => DesktopCaptureSourceType::Screen,
         };
         let mut options = DesktopCapturerOptions::new(kind);
         options.set_include_cursor(true);
-        let mut capturer = DesktopCapturer::new(options)
-            .context("Screen sharing isn't available on this system.")?;
+        let mut capturer = DesktopCapturer::new(options).context(if game_source {
+            "Game-window capture isn't available on this system."
+        } else {
+            "Screen sharing isn't available on this system."
+        })?;
         let captured = Arc::new(Mutex::new(Captured::default()));
         let (into, seen) = (sink.clone(), captured.clone());
         #[cfg(target_os = "linux")]
-        let source = {
-            let _ = source;
-            None
+        let source = match &source {
+            Source::Game(games) => Some(game_window(&mut capturer, games)?),
+            _ => None,
         };
         #[cfg(not(target_os = "linux"))]
-        let source = {
-            let mut listed = capturer.get_source_list().into_iter();
-            let found = match source {
-                Source::Display(id) | Source::Window(id) => listed.find(|listed| listed.id() == id),
-                _ => listed.next(),
-            };
-            Some(found.context("That screen or window is gone.")?)
+        let source = match &source {
+            Source::Game(games) => Some(game_window(&mut capturer, games)?),
+            Source::Display(id) | Source::Window(id) => Some(
+                capturer
+                    .get_source_list()
+                    .into_iter()
+                    .find(|listed| listed.id() == *id)
+                    .context("That screen or window is gone.")?,
+            ),
+            _ => Some(
+                capturer
+                    .get_source_list()
+                    .into_iter()
+                    .next()
+                    .context("That screen or window is gone.")?,
+            ),
         };
         capturer.start_capture(source, move |result| {
             let mut seen = seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1144,8 +1322,13 @@ impl Capture {
                 // While the dialog is open, or between frames.
                 Err(CaptureError::Temporary) => {}
                 Err(CaptureError::Permanent) => {
-                    seen.failed
-                        .get_or_insert_with(|| "Screen sharing stopped.".into());
+                    seen.failed.get_or_insert_with(|| {
+                        if game_source {
+                            "The game window stopped being capturable.".into()
+                        } else {
+                            "Screen sharing stopped.".into()
+                        }
+                    });
                 }
             }
         });

@@ -4,6 +4,7 @@ use super::*;
 
 pub(super) fn bind_callbacks(window: &YapfastWindow, adapter: &Rc<RefCell<Adapter>>) {
     super::games::bind(window, adapter);
+    super::hotkeys::bind(window, adapter);
     super::gifs::bind(window, adapter);
     super::polls::bind(window, adapter);
     super::call_link::bind(window, adapter);
@@ -1162,10 +1163,13 @@ pub(super) fn bind_callbacks(window: &YapfastWindow, adapter: &Rc<RefCell<Adapte
             play_call_volumes(&window);
         }
     });
+    let state = adapter.clone();
     let weak = window.as_weak();
     window.on_record_talk_key(move |on| {
         if let Some(window) = weak.upgrade() {
             window.set_talk_recording(on);
+            window.set_hotkey_recording(0);
+            state.borrow_mut().recording_hotkey(on);
         }
     });
     let state = adapter.clone();
@@ -1216,7 +1220,8 @@ pub(super) fn bind_callbacks(window: &YapfastWindow, adapter: &Rc<RefCell<Adapte
         layout.close_to_tray = Some(window.get_close_to_tray());
         layout.multiple_windows = window.get_multiple_windows();
         adapter.layout.write(&adapter.root);
-        adapter.watch_talk_key(&window);
+        adapter.watch_hotkeys();
+        adapter.show_hotkeys(&window);
         let start = window.get_start_on_sign_in();
         if AUTOSTART.get() && start != autostart::enabled() {
             match autostart::set(start) {
