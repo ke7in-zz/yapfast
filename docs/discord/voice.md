@@ -536,10 +536,19 @@ permission denial does not repeatedly prompt.
 
 `x11_delivers_chords_and_ptt_without_consuming_the_key` exercises a separate
 client's keyboard grab on a private X server.
+The sequential `test-x11` stage in `scripts/check` runs this regression under
+Xvfb with synthetic `xdotool` events.
 `one_portal_session_binds_all_ids_and_emits_command_edges` exercises PTT,
 command edge deduplication, missing and changing assignment descriptions, and
 the version-1 editor limit on a private bus.
-Both ignored tests require their documented private environments.
+The `portal_setup_retries_after_owner_restart_*` tests cover recovery while
+CreateSession and BindShortcuts responses are pending.
+`v2_list_wait_processes_session_signals` covers portal signals, stale responses,
+and PTT hold ownership during a list wait.
+
+`global_hotkey_owner_excludes_other_adapters_until_release` verifies lock
+contention and lease release/reacquisition between application adapters.
+All ignored tests require their documented private environments.
 `push_to_talk_sends_only_while_the_key_is_held` against the fake Discord checks
 that beeps with the key up send nothing and with it held do.
 

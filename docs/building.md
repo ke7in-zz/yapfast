@@ -288,12 +288,14 @@ or Intel's driver.
 `scripts/check` enters the development shell itself. `scripts/check --fast`
 builds with the `fast` profile, as local work does. It runs, in order:
 formatting; `scripts/check-doc-links`, which fails on a Markdown link to a
-missing file or heading; Clippy with warnings denied and the tests for the whole workspace
-(the UI crate is outside the workspace, so Clippy checks it only as a
-dependency, with plain rustc, and doesn't lint its generated code); a
-build; and the desktop smoke test, which runs `target/<profile>/yapfast`,
-the desktop build, from that build. These build the default features, the
-release's: Discord on the desktop (see [Networks](#networks)).
+missing file or heading; Clippy with warnings denied and the tests for the
+whole workspace (the UI crate is outside the workspace, so Clippy checks it
+only as a dependency, with plain rustc, and doesn't lint its generated code);
+the private D-Bus portal tests; the XInput2 raw-input regression under Xvfb
+with synthetic `xdotool` key events; a build; and the desktop smoke test, which
+runs `target/<profile>/yapfast`, the desktop build, from that build. These build
+the default features, the release's: Discord on the desktop (see
+[Networks](#networks)).
 
 `scripts/check --matrix` adds the builds with Matrix, after those and one at
 a time, as each compile of the UI crate takes several GiB of memory: Clippy

@@ -49,21 +49,35 @@ run() {
 }
 
 run_portal_test() {
-  local dbus
+  local dbus test
   dbus="$(nix build 'path:./nix#portal-test-bus^out' --no-link --print-out-paths)" || return 1
-  CC=clang CXX=clang++ CARGO_BUILD_JOBS=2 \
-    "$dbus/bin/dbus-run-session" --dbus-daemon="$dbus/bin/dbus-daemon" \
-    --config-file="$dbus/share/dbus-1/session.conf" -- \
-    env -u DISPLAY -u WAYLAND_DISPLAY XDG_SESSION_TYPE=wayland \
-    cargo test --locked "${profile[@]}" -p yapfast \
-      push_to_talk::linux::tests::portal_protocol_tests::v2_list_wait_processes_session_signals -- --ignored --exact
+  for test in \
+    push_to_talk::linux::tests::portal_protocol_tests::one_portal_session_binds_all_ids_and_emits_command_edges \
+    push_to_talk::linux::tests::portal_protocol_tests::portal_setup_retries_after_owner_restart_during_create_session \
+    push_to_talk::linux::tests::portal_protocol_tests::portal_setup_retries_after_owner_restart_during_bind_shortcuts \
+    push_to_talk::linux::tests::portal_protocol_tests::v2_list_wait_processes_session_signals; do
+    CC=clang CXX=clang++ CARGO_BUILD_JOBS=2 \
+      "$dbus/bin/dbus-run-session" --dbus-daemon="$dbus/bin/dbus-daemon" \
+      --config-file="$dbus/share/dbus-1/session.conf" -- \
+      env -u DISPLAY -u WAYLAND_DISPLAY XDG_SESSION_TYPE=wayland \
+      cargo test --locked "${profile[@]}" -p yapfast "$test" \
+        -- --ignored --exact --test-threads=1 || return 1
+  done
+}
+
+run_x11_test() {
+  nix shell --inputs-from path:./nix nixpkgs#xvfb-run nixpkgs#xdotool -c env \
+    CC=clang CXX=clang++ CARGO_BUILD_JOBS=2 YAPFAST_TEST_PRIVATE_X11=1 \
+    xvfb-run -a cargo test --locked "${profile[@]}" -p yapfast \
+    push_to_talk::linux::tests::x11_delivers_chords_and_ptt_without_consuming_the_key \
+    -- --ignored --exact --test-threads=1
 }
 
 clippy=(cargo clippy --locked "${profile[@]}" --all-targets)
 # feature-union is for the Matrix steps below; with it, the default build would
 # resolve as the full one and compile Slint apart from `cargo build`.
 workspace=(--workspace --exclude feature-union)
-steps=(fmt doc-links clippy test test-portal build smoke)
+steps=(fmt doc-links clippy test test-portal test-x11 build smoke)
 
 run fmt cargo fmt --all -- --check
 run doc-links scripts/check-doc-links
@@ -75,6 +89,7 @@ run clippy "${clippy[@]}" "${workspace[@]}" -- -D warnings
 run test cargo test --locked "${profile[@]}" "${workspace[@]}"
 
 run test-portal run_portal_test
+run test-x11 run_x11_test
 run build cargo build --locked "${profile[@]}" "${workspace[@]}"
 # The binary the build step made: `cargo run` would resolve the dependencies'
 # features for yapfast alone, not the workspace, and compile it again.

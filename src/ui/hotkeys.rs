@@ -643,6 +643,34 @@ mod tests {
     }
 
     #[test]
+    fn global_hotkey_owner_excludes_other_adapters_until_release() {
+        let (directory, _first_window, first) = fixture();
+        let second_window = YapfastWindow::new().unwrap();
+        let runtime = first.borrow().runtime.clone();
+        let second = Adapter::new(runtime, directory.path().into(), &second_window).unwrap();
+        let lock_path = directory.path().join("global-hotkeys.lock");
+        first.borrow_mut().hotkeys.lock_path = Some(lock_path.clone());
+        second.borrow_mut().hotkeys.lock_path = Some(lock_path);
+
+        let first_owner = first
+            .borrow_mut()
+            .claim_hotkeys()
+            .expect("first adapter should claim the global-hotkey lock");
+        first.borrow_mut().hotkeys.owner = Some(first_owner);
+        assert!(matches!(
+            second.borrow_mut().claim_hotkeys(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+
+        first.borrow_mut().hotkeys.owner = None;
+        let second_owner = second
+            .borrow_mut()
+            .claim_hotkeys()
+            .expect("second adapter should claim the released global-hotkey lock");
+        drop(second_owner);
+    }
+
+    #[test]
     fn leaving_settings_cancels_an_in_progress_hotkey_recording() {
         let (directory, window, adapter) = fixture();
         window.show().unwrap();

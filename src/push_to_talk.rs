@@ -2,11 +2,11 @@
 //! GlobalShortcuts portal on Wayland, XI raw input on X11, and Winit's existing
 //! raw-input receiver on Windows. A Windows low-level keyboard hook carries
 //! PTT only. Where global PTT cannot work, the configured key works while
-//! Yapfast's window has focus. Each PTT source calls
-//! [`yapfast_core::push_to_talk::hold`] directly on its press and release.
+//! Yapfast's window has focus. The focused fallback and global listener own
+//! separate holds; a serialized aggregator publishes their logical OR.
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, AtomicU32, Ordering},
+    atomic::{AtomicBool, Ordering},
 };
 
 use serde::{Deserialize, Serialize};
@@ -318,15 +318,12 @@ impl StatusReporter {
             }
         };
         if binding == Binding::Talk {
-            let focused = matches!(reach, Reach::Focused(_));
-            FOCUSED_KEY.store(
-                if focused {
-                    self.talk_scancode.unwrap_or(NONE)
-                } else {
-                    NONE
-                },
-                Ordering::Relaxed,
-            );
+            let scancode = if matches!(&reach, Reach::Focused(_)) {
+                self.talk_scancode
+            } else {
+                None
+            };
+            set_focused_scancode(scancode);
         }
         if changed {
             (self.callback)(binding, reach);
@@ -514,24 +511,78 @@ impl Reach {
     }
 }
 
-/// The key's scan code while the window's own events stand in for PTT;
-/// [`NONE`] otherwise.
-static FOCUSED_KEY: AtomicU32 = AtomicU32::new(NONE);
-const NONE: u32 = u32::MAX;
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct HoldSources {
+    global: bool,
+    focused: bool,
+    focused_scancode: Option<u32>,
+}
+
+static HOLD_SOURCES: Mutex<HoldSources> = Mutex::new(HoldSources {
+    global: false,
+    focused: false,
+    focused_scancode: None,
+});
+
+fn change_hold_sources(change: impl FnOnce(&mut HoldSources)) {
+    let mut sources = HOLD_SOURCES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let previous = *sources;
+    change(&mut sources);
+    if *sources != previous {
+        yapfast_core::push_to_talk::hold(sources.global || sources.focused);
+    }
+}
+
+pub(super) fn global_hold(held: bool) {
+    change_hold_sources(|sources| sources.global = held);
+}
+
+fn set_focused_scancode(scancode: Option<u32>) {
+    change_hold_sources(|sources| {
+        if sources.focused_scancode != scancode {
+            sources.focused = false;
+            sources.focused_scancode = scancode;
+        }
+    });
+}
+
+fn clear_focused_hold() {
+    change_hold_sources(|sources| sources.focused = false);
+}
+
+// Winit 0.30.13 keeps `KeyEvent`'s fields private, so tests drive this
+// production keyboard handler directly instead of constructing that event.
+pub(super) fn focused_key_event(scancode: Option<u32>, state: ElementState, repeat: bool) {
+    if repeat {
+        return;
+    }
+    let Some(scancode) = scancode else {
+        return;
+    };
+    change_hold_sources(|sources| {
+        if sources.focused_scancode == Some(scancode) {
+            sources.focused = state == ElementState::Pressed;
+        }
+    });
+}
+
+pub(super) fn reset_hold_sources() {
+    let mut sources = HOLD_SOURCES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *sources = HoldSources::default();
+    yapfast_core::push_to_talk::hold(false);
+}
 
 /// PTT-only fallback while the global listener cannot watch the key.
 pub fn window_event(event: &WindowEvent) {
-    let key = FOCUSED_KEY.load(Ordering::Relaxed);
-    if key == NONE {
-        return;
-    }
     match event {
-        WindowEvent::KeyboardInput { event, .. }
-            if !event.repeat && event.physical_key.to_scancode() == Some(key) =>
-        {
-            yapfast_core::push_to_talk::hold(event.state == ElementState::Pressed);
+        WindowEvent::KeyboardInput { event, .. } => {
+            focused_key_event(event.physical_key.to_scancode(), event.state, event.repeat)
         }
-        WindowEvent::Focused(false) => yapfast_core::push_to_talk::hold(false),
+        WindowEvent::Focused(false) => clear_focused_hold(),
         _ => {}
     }
 }
@@ -546,7 +597,7 @@ pub struct Watcher {
     #[cfg(target_os = "linux")]
     configure: Option<linux::Configure>,
     #[cfg(windows)]
-    _global: windows::Global,
+    _global: Option<windows::Global>,
 }
 
 impl Watcher {
@@ -556,7 +607,7 @@ impl Watcher {
         command: impl Fn(Command) + Send + Sync + 'static,
         told: impl Fn(Binding, Reach) + Send + Sync + 'static,
     ) -> Self {
-        FOCUSED_KEY.store(NONE, Ordering::Relaxed);
+        reset_hold_sources();
         let statuses = StatusReporter::new(&bindings, told);
         statuses.asking(&bindings);
         let actions = Actions::new(command);
@@ -597,7 +648,7 @@ impl Watcher {
             #[cfg(target_os = "linux")]
             configure,
             #[cfg(windows)]
-            _global: global,
+            _global: Some(global),
         }
     }
 
@@ -634,7 +685,8 @@ impl Watcher {
 
 impl Drop for Watcher {
     fn drop(&mut self) {
-        FOCUSED_KEY.store(NONE, Ordering::Relaxed);
-        yapfast_core::push_to_talk::hold(false);
+        #[cfg(any(target_os = "linux", windows))]
+        drop(self._global.take());
+        reset_hold_sources();
     }
 }

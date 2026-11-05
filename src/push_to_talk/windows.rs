@@ -123,7 +123,7 @@ impl Input {
 
     fn reset_matcher(&mut self) {
         let _ = self.matcher.clear();
-        yapfast_core::push_to_talk::hold(false);
+        super::global_hold(false);
     }
 
     fn synchronize_keys(&mut self) {
@@ -741,6 +741,7 @@ impl Drop for Hook {
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
+        super::global_hold(false);
     }
 }
 
@@ -757,8 +758,8 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
         };
         if key.scanCode | extended == PTT_KEY.load(Ordering::Relaxed) {
             match wparam as u32 {
-                WM_KEYDOWN | WM_SYSKEYDOWN => yapfast_core::push_to_talk::hold(true),
-                WM_KEYUP | WM_SYSKEYUP => yapfast_core::push_to_talk::hold(false),
+                WM_KEYDOWN | WM_SYSKEYDOWN => super::global_hold(true),
+                WM_KEYUP | WM_SYSKEYUP => super::global_hold(false),
                 _ => {}
             }
         }
@@ -862,7 +863,7 @@ mod tests {
         struct Reset;
         impl Drop for Reset {
             fn drop(&mut self) {
-                yapfast_core::push_to_talk::hold(false);
+                crate::push_to_talk::reset_hold_sources();
                 yapfast_core::push_to_talk::set_on(false);
             }
         }

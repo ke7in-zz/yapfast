@@ -248,7 +248,7 @@ async fn portal_session(
         )
         .await
         .map_err(|error| PortalFailure::Transient(error.into()))?;
-    let results = response(&mut signals, &request("session")).await?;
+    let results = response(&mut signals, &mut owners, &request("session")).await?;
     let session = match results.get("session_handle").map(|value| &**value) {
         Some(Value::Str(handle)) => OwnedObjectPath::try_from(handle.as_str())
             .map_err(|error| PortalFailure::Transient(error.into()))?,
@@ -280,7 +280,7 @@ async fn portal_session(
         )
         .await
         .map_err(|error| PortalFailure::Transient(error.into()))?;
-    let results = response(&mut signals, &request("bind")).await?;
+    let results = response(&mut signals, &mut owners, &request("bind")).await?;
     let mut events = PortalEvents {
         session: &session,
         bindings,
@@ -355,6 +355,24 @@ where
     Err(PortalFailure::Transient(anyhow!("the session bus closed")))
 }
 
+fn portal_owner_restart(
+    owner: Option<zbus::fdo::NameOwnerChanged>,
+) -> Result<Option<bool>, PortalFailure> {
+    let Some(owner) = owner else {
+        return Err(PortalFailure::Transient(anyhow!("the session bus closed")));
+    };
+    let (name, old_owner, new_owner) = owner
+        .message()
+        .body()
+        .deserialize::<(String, String, String)>()
+        .map_err(|error| PortalFailure::Transient(error.into()))?;
+    if name == PORTAL && !old_owner.is_empty() && old_owner != new_owner {
+        Ok(Some(new_owner.is_empty()))
+    } else {
+        Ok(None)
+    }
+}
+
 async fn handle_owner_change<S>(
     events: &mut PortalEvents<'_>,
     owner: Option<zbus::fdo::NameOwnerChanged>,
@@ -363,34 +381,24 @@ async fn handle_owner_change<S>(
 where
     S: futures_util::Stream<Item = zbus::fdo::NameOwnerChanged> + Unpin,
 {
-    let Some(owner) = owner else {
-        events.clear();
-        return Err(PortalFailure::Transient(anyhow!("the session bus closed")));
-    };
-    let (name, old_owner, new_owner) = match owner
-        .message()
-        .body()
-        .deserialize::<(String, String, String)>()
-    {
-        Ok(args) => args,
+    let unavailable = match portal_owner_restart(owner) {
+        Ok(Some(unavailable)) => unavailable,
+        Ok(None) => return Ok(None),
         Err(error) => {
             events.clear();
-            return Err(PortalFailure::Transient(error.into()));
+            return Err(error);
         }
     };
-    if name == PORTAL && !old_owner.is_empty() && old_owner != new_owner {
-        events.clear();
-        report_portal_unavailable(
-            events.bindings,
-            events.statuses,
-            "The desktop's global-shortcut service restarted",
-        );
-        if new_owner.is_empty() {
-            wait_for_service_return(owners).await?;
-        }
-        return Ok(Some(PortalExit::Returned));
+    events.clear();
+    report_portal_unavailable(
+        events.bindings,
+        events.statuses,
+        "The desktop's global-shortcut service restarted",
+    );
+    if unavailable {
+        wait_for_service_return(owners).await?;
     }
-    Ok(None)
+    Ok(Some(PortalExit::Returned))
 }
 
 async fn configuration_supported(connection: &Connection) -> bool {
@@ -522,17 +530,34 @@ fn request_response(
     }
 }
 
-async fn response(
+async fn response<S>(
     signals: &mut MessageStream,
+    owners: &mut S,
     request: &str,
-) -> Result<HashMap<String, OwnedValue>, PortalFailure> {
-    while let Some(message) = signals.next().await {
-        let message = message.map_err(|error| PortalFailure::Transient(error.into()))?;
-        if let Some(results) = request_response(&message, request)? {
-            return Ok(results);
+) -> Result<HashMap<String, OwnedValue>, PortalFailure>
+where
+    S: futures_util::Stream<Item = zbus::fdo::NameOwnerChanged> + Unpin,
+{
+    loop {
+        futures_util::select! {
+            incoming = signals.next().fuse() => {
+                let Some(incoming) = incoming else {
+                    return Err(PortalFailure::Transient(anyhow!("the session bus closed")));
+                };
+                let message = incoming.map_err(|error| PortalFailure::Transient(error.into()))?;
+                if let Some(results) = request_response(&message, request)? {
+                    return Ok(results);
+                }
+            },
+            owner = owners.next().fuse() => {
+                if portal_owner_restart(owner)?.is_some() {
+                    return Err(PortalFailure::Transient(anyhow!(
+                        "the desktop's global-shortcut service restarted"
+                    )));
+                }
+            },
         }
     }
-    Err(PortalFailure::Transient(anyhow!("the session bus closed")))
 }
 
 fn shortcuts(results: &HashMap<String, OwnedValue>) -> Vec<(String, HashMap<String, OwnedValue>)> {
@@ -553,7 +578,7 @@ struct PortalState {
 impl PortalState {
     fn clear(&mut self) {
         if self.active[Binding::Talk.index()] {
-            yapfast_core::push_to_talk::hold(false);
+            super::global_hold(false);
         }
         self.active = [false; 3];
     }
@@ -574,7 +599,7 @@ impl PortalState {
         }
         self.active[index] = pressed;
         match (binding, pressed) {
-            (Binding::Talk, held) => yapfast_core::push_to_talk::hold(held),
+            (Binding::Talk, held) => super::global_hold(held),
             (Binding::ToggleStream, true) => actions.emit(Command::ToggleStream),
             (Binding::LeaveVoice, true) => actions.emit(Command::LeaveVoice),
             (_, false) => {}
@@ -619,7 +644,7 @@ fn update_grants(
     for binding in [Binding::Talk, Binding::ToggleStream, Binding::LeaveVoice] {
         let index = binding.index();
         if state.active[index] && !next[index] && binding == Binding::Talk {
-            yapfast_core::push_to_talk::hold(false);
+            super::global_hold(false);
         }
         if !next[index] {
             state.active[index] = false;
@@ -752,7 +777,7 @@ fn report_x11_unavailable(bindings: &Bindings, statuses: &StatusReporter) {
 
 fn dispatch(edges: crate::push_to_talk::matcher::Edges, actions: &Actions) {
     if let Some(held) = edges.talk {
-        yapfast_core::push_to_talk::hold(held);
+        super::global_hold(held);
     }
     for command in edges.commands() {
         actions.emit(command);
@@ -1137,6 +1162,10 @@ mod tests {
         }
     }
 
+    fn focused_window_key(state: slint::winit_030::winit::event::ElementState) {
+        crate::push_to_talk::focused_key_event(Some(47), state, false);
+    }
+
     /// Needs DISPLAY on a private X server, such as Xvfb, and xdotool.
     #[test]
     #[ignore = "needs DISPLAY on a private X server and xdotool"]
@@ -1207,7 +1236,11 @@ mod tests {
     #[cfg(test)]
     mod portal_protocol_tests {
         use std::{
-            sync::{Arc, mpsc},
+            sync::{
+                Arc,
+                atomic::{AtomicBool, Ordering},
+                mpsc,
+            },
             time::Instant,
         };
 
@@ -1216,6 +1249,10 @@ mod tests {
         struct FakePortal {
             version: u32,
             list_requests: Option<mpsc::Sender<OwnedObjectPath>>,
+            session_requests: Option<mpsc::Sender<OwnedObjectPath>>,
+            bind_requests: Option<mpsc::Sender<OwnedObjectPath>>,
+            hold_session_response: AtomicBool,
+            hold_bind_response: AtomicBool,
         }
 
         #[zbus::interface(name = "org.freedesktop.portal.GlobalShortcuts")]
@@ -1232,6 +1269,12 @@ mod tests {
                 #[zbus(connection)] connection: &Connection,
             ) -> OwnedObjectPath {
                 let request = request_path(&header, &options);
+                if let Some(requests) = &self.session_requests {
+                    requests.send(request.clone()).unwrap();
+                }
+                if self.hold_session_response.swap(false, Ordering::SeqCst) {
+                    return request;
+                }
                 let session = format!("{PATH}/session/test/1");
                 let results = HashMap::from([("session_handle", Value::from(session))]);
                 respond(connection, &request, results).await;
@@ -1271,6 +1314,12 @@ mod tests {
                         }
                     })
                     .collect::<Vec<_>>();
+                if let Some(requests) = &self.bind_requests {
+                    requests.send(request.clone()).unwrap();
+                }
+                if self.hold_bind_response.swap(false, Ordering::SeqCst) {
+                    return request;
+                }
                 respond(
                     connection,
                     &request,
@@ -1450,7 +1499,7 @@ mod tests {
                 is_wayland_session(),
                 "set WAYLAND_DISPLAY or XDG_SESSION_TYPE=wayland for the private portal scenario"
             );
-            yapfast_core::push_to_talk::hold(false);
+            crate::push_to_talk::reset_hold_sources();
 
             let server = zbus::blocking::connection::Builder::session()
                 .unwrap()
@@ -1461,6 +1510,10 @@ mod tests {
                     FakePortal {
                         version: 1,
                         list_requests: None,
+                        session_requests: None,
+                        bind_requests: None,
+                        hold_session_response: AtomicBool::new(false),
+                        hold_bind_response: AtomicBool::new(false),
                     },
                 )
                 .unwrap()
@@ -1559,12 +1612,210 @@ mod tests {
 
         #[test]
         #[ignore = "needs a private session bus and a Wayland session"]
+        fn portal_setup_retries_after_owner_restart_during_create_session() {
+            assert!(
+                is_wayland_session(),
+                "set WAYLAND_DISPLAY or XDG_SESSION_TYPE=wayland for the private portal scenario"
+            );
+            struct ResetPtt;
+            impl Drop for ResetPtt {
+                fn drop(&mut self) {
+                    crate::push_to_talk::reset_hold_sources();
+                    yapfast_core::push_to_talk::set_on(false);
+                    yapfast_core::push_to_talk::set_release_delay(
+                        yapfast_core::push_to_talk::DEFAULT_RELEASE_DELAY,
+                    );
+                }
+            }
+            let _reset = ResetPtt;
+            crate::push_to_talk::reset_hold_sources();
+            yapfast_core::push_to_talk::set_on(true);
+            yapfast_core::push_to_talk::set_release_delay(0);
+
+            let (session_requests, requested_sessions) = mpsc::channel();
+            let server = zbus::blocking::connection::Builder::session()
+                .unwrap()
+                .name(PORTAL)
+                .unwrap()
+                .serve_at(
+                    PATH,
+                    FakePortal {
+                        version: 1,
+                        list_requests: None,
+                        session_requests: Some(session_requests),
+                        bind_requests: None,
+                        hold_session_response: AtomicBool::new(true),
+                        hold_bind_response: AtomicBool::new(false),
+                    },
+                )
+                .unwrap()
+                .build()
+                .unwrap();
+            let bindings = Bindings {
+                talk: Some(key(47, Some("v"))),
+                toggle_stream: Some(Chord {
+                    key: key(46, Some("c")),
+                    modifiers: crate::push_to_talk::ModifierMask::CTRL,
+                }),
+                leave_voice: Some(Chord {
+                    key: key(45, Some("x")),
+                    modifiers: crate::push_to_talk::ModifierMask::ALT,
+                }),
+            };
+            let runtime = BackgroundRuntime::new().unwrap();
+            let watcher =
+                crate::push_to_talk::Watcher::start(bindings, &runtime, |_| {}, |_, _| {});
+            watcher.set_commands_enabled(true);
+
+            let _first_request = requested_sessions
+                .recv_timeout(Duration::from_secs(2))
+                .expect("the portal did not receive CreateSession");
+            // Let the fake return its request path so the client is waiting for Response.
+            thread::sleep(Duration::from_millis(100));
+            let release_reply = zbus::block_on(server.inner().call_method(
+                Some("org.freedesktop.DBus"),
+                "/org/freedesktop/DBus",
+                Some("org.freedesktop.DBus"),
+                "ReleaseName",
+                &(PORTAL,),
+            ))
+            .unwrap();
+            assert_eq!(release_reply.body().deserialize::<u32>().unwrap(), 1);
+            wait_status(
+                &watcher,
+                Binding::Talk,
+                Reach::Focused("The desktop's global-shortcut service is unavailable"),
+            );
+
+            let request_reply = zbus::block_on(server.inner().call_method(
+                Some("org.freedesktop.DBus"),
+                "/org/freedesktop/DBus",
+                Some("org.freedesktop.DBus"),
+                "RequestName",
+                &(PORTAL, 0u32),
+            ))
+            .unwrap();
+            assert_eq!(request_reply.body().deserialize::<u32>().unwrap(), 1);
+            let _retry_request = requested_sessions
+                .recv_timeout(Duration::from_secs(2))
+                .expect("the portal worker did not retry CreateSession after owner loss");
+            wait_status(&watcher, Binding::Talk, Reach::Everywhere(Some("V".into())));
+
+            let session = OwnedObjectPath::try_from(format!("{PATH}/session/test/1")).unwrap();
+            zbus::block_on(press(server.inner(), &session, TALK_ID, "Activated"));
+            wait_held(true);
+            assert!(yapfast_core::push_to_talk::sending());
+            zbus::block_on(press(server.inner(), &session, TALK_ID, "Deactivated"));
+            wait_held(false);
+            assert!(!yapfast_core::push_to_talk::sending());
+
+            drop(watcher);
+            drop(server);
+        }
+
+        #[test]
+        #[ignore = "needs a private session bus and a Wayland session"]
+        fn portal_setup_retries_after_owner_restart_during_bind_shortcuts() {
+            assert!(
+                is_wayland_session(),
+                "set WAYLAND_DISPLAY or XDG_SESSION_TYPE=wayland for the private portal scenario"
+            );
+            struct ResetPtt;
+            impl Drop for ResetPtt {
+                fn drop(&mut self) {
+                    crate::push_to_talk::reset_hold_sources();
+                    yapfast_core::push_to_talk::set_on(false);
+                    yapfast_core::push_to_talk::set_release_delay(
+                        yapfast_core::push_to_talk::DEFAULT_RELEASE_DELAY,
+                    );
+                }
+            }
+            let _reset = ResetPtt;
+            crate::push_to_talk::reset_hold_sources();
+            yapfast_core::push_to_talk::set_on(true);
+            yapfast_core::push_to_talk::set_release_delay(0);
+
+            let (bind_requests, requested_binds) = mpsc::channel();
+            let server = zbus::blocking::connection::Builder::session()
+                .unwrap()
+                .name(PORTAL)
+                .unwrap()
+                .serve_at(
+                    PATH,
+                    FakePortal {
+                        version: 2,
+                        list_requests: None,
+                        session_requests: None,
+                        bind_requests: Some(bind_requests),
+                        hold_session_response: AtomicBool::new(false),
+                        hold_bind_response: AtomicBool::new(true),
+                    },
+                )
+                .unwrap()
+                .build()
+                .unwrap();
+            let bindings = Bindings {
+                talk: Some(key(47, Some("v"))),
+                toggle_stream: Some(Chord {
+                    key: key(46, Some("c")),
+                    modifiers: crate::push_to_talk::ModifierMask::CTRL,
+                }),
+                leave_voice: Some(Chord {
+                    key: key(45, Some("x")),
+                    modifiers: crate::push_to_talk::ModifierMask::ALT,
+                }),
+            };
+            let runtime = BackgroundRuntime::new().unwrap();
+            let watcher =
+                crate::push_to_talk::Watcher::start(bindings, &runtime, |_| {}, |_, _| {});
+            watcher.set_commands_enabled(true);
+
+            let _first_request = requested_binds
+                .recv_timeout(Duration::from_secs(2))
+                .expect("the portal did not receive BindShortcuts");
+            // Let the fake return its request path so the client is waiting for Response.
+            thread::sleep(Duration::from_millis(100));
+            let release_reply = zbus::block_on(server.inner().call_method(
+                Some("org.freedesktop.DBus"),
+                "/org/freedesktop/DBus",
+                Some("org.freedesktop.DBus"),
+                "ReleaseName",
+                &(PORTAL,),
+            ))
+            .unwrap();
+            assert_eq!(release_reply.body().deserialize::<u32>().unwrap(), 1);
+            wait_status(
+                &watcher,
+                Binding::Talk,
+                Reach::Focused("The desktop's global-shortcut service is unavailable"),
+            );
+
+            let request_reply = zbus::block_on(server.inner().call_method(
+                Some("org.freedesktop.DBus"),
+                "/org/freedesktop/DBus",
+                Some("org.freedesktop.DBus"),
+                "RequestName",
+                &(PORTAL, 0u32),
+            ))
+            .unwrap();
+            assert_eq!(request_reply.body().deserialize::<u32>().unwrap(), 1);
+            let _retry_request = requested_binds
+                .recv_timeout(Duration::from_secs(2))
+                .expect("the portal worker did not retry BindShortcuts after owner loss");
+            wait_status(&watcher, Binding::Talk, Reach::Everywhere(Some("V".into())));
+
+            drop(watcher);
+            drop(server);
+        }
+
+        #[test]
+        #[ignore = "needs a private session bus and a Wayland session"]
         fn v2_list_wait_processes_session_signals() {
             assert!(
                 is_wayland_session(),
                 "set WAYLAND_DISPLAY or XDG_SESSION_TYPE=wayland for the private portal scenario"
             );
-            yapfast_core::push_to_talk::hold(false);
+            crate::push_to_talk::reset_hold_sources();
             yapfast_core::push_to_talk::set_on(true);
             yapfast_core::push_to_talk::set_release_delay(0);
 
@@ -1578,13 +1829,17 @@ mod tests {
                     FakePortal {
                         version: 2,
                         list_requests: Some(list_requests),
+                        session_requests: None,
+                        bind_requests: None,
+                        hold_session_response: AtomicBool::new(false),
+                        hold_bind_response: AtomicBool::new(false),
                     },
                 )
                 .unwrap()
                 .build()
                 .unwrap();
             let bindings = Bindings {
-                talk: Some(key(47, Some("v"))),
+                talk: Some(key(47, Some("w"))),
                 toggle_stream: Some(Chord {
                     key: key(46, Some("c")),
                     modifiers: crate::push_to_talk::ModifierMask::CTRL,
@@ -1606,7 +1861,7 @@ mod tests {
                 move |binding, reach| heard_statuses.lock().unwrap().push((binding, reach)),
             );
             watcher.set_commands_enabled(true);
-            wait_status(&watcher, Binding::Talk, Reach::Everywhere(Some("V".into())));
+            wait_status(&watcher, Binding::Talk, Reach::Everywhere(Some("W".into())));
             let session = OwnedObjectPath::try_from(format!("{PATH}/session/test/1")).unwrap();
             zbus::block_on(press(server.inner(), &session, TALK_ID, "Activated"));
             wait_held(true);
@@ -1662,6 +1917,9 @@ mod tests {
                 Binding::Talk,
                 Reach::Focused("The desktop's global-shortcut service restarted"),
             );
+            focused_window_key(slint::winit_030::winit::event::ElementState::Pressed);
+            assert!(yapfast_core::push_to_talk::held());
+            assert!(yapfast_core::push_to_talk::sending());
 
             let request_reply = zbus::block_on(server.inner().call_method(
                 Some("org.freedesktop.DBus"),
@@ -1679,7 +1937,43 @@ mod tests {
             );
             // An old list response from the restarted service must not restore its grants.
             zbus::block_on(respond(server.inner(), &second_list, list_results("STALE")));
-            wait_status(&watcher, Binding::Talk, Reach::Everywhere(Some("V".into())));
+            wait_status(&watcher, Binding::Talk, Reach::Everywhere(Some("W".into())));
+            focused_window_key(slint::winit_030::winit::event::ElementState::Released);
+            assert!(
+                !yapfast_core::push_to_talk::held(),
+                "grant recovery must release the focused fallback hold"
+            );
+            assert!(
+                !yapfast_core::push_to_talk::sending(),
+                "grant recovery must not leave the microphone transmitting"
+            );
+            crate::push_to_talk::global_hold(true);
+            watcher
+                .statuses
+                .set(Binding::Talk, Reach::Focused("fallback source test"));
+            focused_window_key(slint::winit_030::winit::event::ElementState::Pressed);
+            assert!(yapfast_core::push_to_talk::held());
+            assert!(yapfast_core::push_to_talk::sending());
+            crate::push_to_talk::window_event(
+                &slint::winit_030::winit::event::WindowEvent::Focused(false),
+            );
+            assert!(
+                yapfast_core::push_to_talk::held(),
+                "window focus loss must preserve an independent global hold"
+            );
+            assert!(yapfast_core::push_to_talk::sending());
+            watcher
+                .statuses
+                .set(Binding::Talk, Reach::Everywhere(Some("W".into())));
+            focused_window_key(slint::winit_030::winit::event::ElementState::Released);
+            assert!(
+                yapfast_core::push_to_talk::held(),
+                "focused cleanup must preserve the independent global hold"
+            );
+            assert!(yapfast_core::push_to_talk::sending());
+            crate::push_to_talk::global_hold(false);
+            wait_held(false);
+            assert!(!yapfast_core::push_to_talk::sending());
             let stale_grant = Reach::Everywhere(Some("STALE".into()));
             assert!(
                 !statuses
