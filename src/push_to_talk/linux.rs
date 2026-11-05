@@ -281,83 +281,56 @@ async fn portal_session(
         .await
         .map_err(|error| PortalFailure::Transient(error.into()))?;
     let results = response(&mut signals, &request("bind")).await?;
-    let mut state = PortalState::default();
+    let mut events = PortalEvents {
+        session: &session,
+        bindings,
+        requested: &requested,
+        statuses,
+        actions,
+        state: PortalState::default(),
+    };
     statuses.set_configuration_available(configuration_supported);
-    update_grants(&requested, &shortcuts(&results), statuses, &mut state);
+    events.refresh_grants(&shortcuts(&results));
 
     loop {
         futures_util::select! {
             incoming = signals.next().fuse() => {
                 let Some(incoming) = incoming else {
-                    state.clear();
+                    events.clear();
                     return Err(PortalFailure::Transient(anyhow!("the session bus closed")));
                 };
                 let message = incoming.map_err(|error| {
-                    state.clear();
+                    events.clear();
                     PortalFailure::Transient(error.into())
                 })?;
-                match message.header().member().map(|member| member.as_str()) {
-                    Some("Activated") | Some("Deactivated") => {
-                        if let Ok((path, id, ..)) = message.body().deserialize::<
-                            (ObjectPath, &str, u64, HashMap<String, OwnedValue>)
-                        >() && path == *session {
-                            state.activation(
-                                id,
-                                message.header().member().is_some_and(|member| member.as_str() == "Activated"),
-                                &requested,
-                                actions,
-                            );
-                        }
-                    }
-                    Some("ShortcutsChanged") => {
-                        if let Ok((path, changed)) = message.body().deserialize::<
-                            (ObjectPath, Vec<(String, HashMap<String, OwnedValue>)>)
-                        >() && path == *session {
-                            update_grants(&requested, &changed, statuses, &mut state);
-                        }
-                    }
-                    Some("Closed") if message.header().path().is_some_and(|path| *path == *session) => {
-                        state.clear();
-                        report_portal_unavailable(
-                            bindings,
-                            statuses,
-                            "The desktop's global-shortcut service closed this session",
-                        );
-                        return Ok(PortalExit::Stopped);
-                    }
-                    _ => {}
+                if let Some(exit) = events.signal(&message) {
+                    return Ok(exit);
                 }
             },
             owner = owners.next().fuse() => {
-                let Some(owner) = owner else {
-                    state.clear();
-                    return Err(PortalFailure::Transient(anyhow!("the session bus closed")));
-                };
-                let args = owner.message().body().deserialize::<(String, String, String)>()
-                    .map_err(|error| PortalFailure::Transient(error.into()))?;
-                let (name, old_owner, new_owner) = args;
-                if name == PORTAL && !old_owner.is_empty() && old_owner != new_owner {
-                    state.clear();
-                    report_portal_unavailable(
-                        bindings,
-                        statuses,
-                        "The desktop's global-shortcut service restarted",
-                    );
-                    if new_owner.is_empty() {
-                        wait_for_service_return(&mut owners).await?;
-                    }
-                    return Ok(PortalExit::Returned);
+                if let Some(exit) = handle_owner_change(&mut events, owner, &mut owners).await? {
+                    return Ok(exit);
                 }
             },
             requested_configuration = requests.recv().fuse() => {
                 let Some(()) = requested_configuration else {
-                    state.clear();
+                    events.clear();
                     return Ok(PortalExit::Stopped);
                 };
                 if configure_shortcuts(&connection, &session).await {
-                    let list = list_shortcuts(&connection, &session, &mut signals, &token).await;
-                    if let Ok(list) = list {
-                        update_grants(&requested, &list, statuses, &mut state);
+                    match list_shortcuts(
+                        &connection,
+                        &mut signals,
+                        &mut owners,
+                        &token,
+                        &mut events,
+                    )
+                    .await
+                    {
+                        Ok(ShortcutList::Updated(list)) => events.refresh_grants(&list),
+                        Ok(ShortcutList::Exit(exit)) => return Ok(exit),
+                        Err(PortalFailure::Denied) => {}
+                        Err(error @ PortalFailure::Transient(_)) => return Err(error),
                     }
                 }
             },
@@ -380,6 +353,44 @@ where
         }
     }
     Err(PortalFailure::Transient(anyhow!("the session bus closed")))
+}
+
+async fn handle_owner_change<S>(
+    events: &mut PortalEvents<'_>,
+    owner: Option<zbus::fdo::NameOwnerChanged>,
+    owners: &mut S,
+) -> Result<Option<PortalExit>, PortalFailure>
+where
+    S: futures_util::Stream<Item = zbus::fdo::NameOwnerChanged> + Unpin,
+{
+    let Some(owner) = owner else {
+        events.clear();
+        return Err(PortalFailure::Transient(anyhow!("the session bus closed")));
+    };
+    let (name, old_owner, new_owner) = match owner
+        .message()
+        .body()
+        .deserialize::<(String, String, String)>()
+    {
+        Ok(args) => args,
+        Err(error) => {
+            events.clear();
+            return Err(PortalFailure::Transient(error.into()));
+        }
+    };
+    if name == PORTAL && !old_owner.is_empty() && old_owner != new_owner {
+        events.clear();
+        report_portal_unavailable(
+            events.bindings,
+            events.statuses,
+            "The desktop's global-shortcut service restarted",
+        );
+        if new_owner.is_empty() {
+            wait_for_service_return(owners).await?;
+        }
+        return Ok(Some(PortalExit::Returned));
+    }
+    Ok(None)
 }
 
 async fn configuration_supported(connection: &Connection) -> bool {
@@ -415,12 +426,21 @@ async fn configure_shortcuts(connection: &Connection, session: &OwnedObjectPath)
         .is_ok()
 }
 
-async fn list_shortcuts(
+enum ShortcutList {
+    Updated(Vec<(String, HashMap<String, OwnedValue>)>),
+    Exit(PortalExit),
+}
+
+async fn list_shortcuts<S>(
     connection: &Connection,
-    session: &OwnedObjectPath,
     signals: &mut MessageStream,
+    owners: &mut S,
     token: &str,
-) -> Result<Vec<(String, HashMap<String, OwnedValue>)>, PortalFailure> {
+    events: &mut PortalEvents<'_>,
+) -> Result<ShortcutList, PortalFailure>
+where
+    S: futures_util::Stream<Item = zbus::fdo::NameOwnerChanged> + Unpin,
+{
     let token = format!("{token}_list");
     let options = HashMap::from([("handle_token", Value::from(token.clone()))]);
     connection
@@ -429,20 +449,77 @@ async fn list_shortcuts(
             PATH,
             Some(SHORTCUTS),
             "ListShortcuts",
-            &(session, options),
+            &(events.session, options),
         )
         .await
-        .map_err(|error| PortalFailure::Transient(error.into()))?;
+        .map_err(|error| {
+            events.clear();
+            PortalFailure::Transient(error.into())
+        })?;
     let request = connection
         .unique_name()
         .context("no name on the session bus")
-        .map_err(PortalFailure::Transient)?
+        .map_err(|error| {
+            events.clear();
+            PortalFailure::Transient(error)
+        })?
         .trim_start_matches(':')
         .replace('.', "_");
     let path = format!("{PATH}/request/{request}/{token}");
-    response(signals, &path)
-        .await
-        .map(|results| shortcuts(&results))
+    loop {
+        futures_util::select! {
+            incoming = signals.next().fuse() => {
+                let Some(incoming) = incoming else {
+                    events.clear();
+                    return Err(PortalFailure::Transient(anyhow!("the session bus closed")));
+                };
+                let message = incoming.map_err(|error| {
+                    events.clear();
+                    PortalFailure::Transient(error.into())
+                })?;
+                if let Some(exit) = events.signal(&message) {
+                    return Ok(ShortcutList::Exit(exit));
+                }
+                match request_response(&message, &path) {
+                    Ok(Some(results)) => return Ok(ShortcutList::Updated(shortcuts(&results))),
+                    Ok(None) => {}
+                    Err(PortalFailure::Denied) => return Err(PortalFailure::Denied),
+                    Err(error @ PortalFailure::Transient(_)) => {
+                        events.clear();
+                        return Err(error);
+                    }
+                }
+            },
+            owner = owners.next().fuse() => {
+                if let Some(exit) = handle_owner_change(events, owner, owners).await? {
+                    return Ok(ShortcutList::Exit(exit));
+                }
+            }
+        }
+    }
+}
+
+fn request_response(
+    message: &zbus::message::Message,
+    request: &str,
+) -> Result<Option<HashMap<String, OwnedValue>>, PortalFailure> {
+    let header = message.header();
+    if header
+        .member()
+        .is_none_or(|member| member.as_str() != "Response")
+        || header.path().is_none_or(|path| path.as_str() != request)
+    {
+        return Ok(None);
+    }
+    let (code, results) = message
+        .body()
+        .deserialize::<(u32, HashMap<String, OwnedValue>)>()
+        .map_err(|error| PortalFailure::Transient(error.into()))?;
+    if code == 0 {
+        Ok(Some(results))
+    } else {
+        Err(PortalFailure::Denied)
+    }
 }
 
 async fn response(
@@ -451,22 +528,9 @@ async fn response(
 ) -> Result<HashMap<String, OwnedValue>, PortalFailure> {
     while let Some(message) = signals.next().await {
         let message = message.map_err(|error| PortalFailure::Transient(error.into()))?;
-        let header = message.header();
-        if header
-            .member()
-            .is_none_or(|member| member.as_str() != "Response")
-            || header.path().is_none_or(|path| path.as_str() != request)
-        {
-            continue;
-        }
-        let (code, results) = message
-            .body()
-            .deserialize::<(u32, HashMap<String, OwnedValue>)>()
-            .map_err(|error| PortalFailure::Transient(error.into()))?;
-        if code == 0 {
+        if let Some(results) = request_response(&message, request)? {
             return Ok(results);
         }
-        return Err(PortalFailure::Denied);
     }
     Err(PortalFailure::Transient(anyhow!("the session bus closed")))
 }
@@ -562,6 +626,73 @@ fn update_grants(
         }
     }
     state.granted = next;
+}
+
+struct PortalEvents<'a> {
+    session: &'a OwnedObjectPath,
+    bindings: &'a Bindings,
+    requested: &'a [(Binding, &'static str, &'static str, Option<String>)],
+    statuses: &'a StatusReporter,
+    actions: &'a Actions,
+    state: PortalState,
+}
+
+impl PortalEvents<'_> {
+    fn clear(&mut self) {
+        self.state.clear();
+    }
+
+    fn refresh_grants(&mut self, bound: &[(String, HashMap<String, OwnedValue>)]) {
+        update_grants(self.requested, bound, self.statuses, &mut self.state);
+    }
+
+    fn signal(&mut self, message: &zbus::message::Message) -> Option<PortalExit> {
+        match message.header().member().map(|member| member.as_str()) {
+            Some("Activated") | Some("Deactivated") => {
+                if let Ok((path, id, ..)) =
+                    message
+                        .body()
+                        .deserialize::<(ObjectPath, &str, u64, HashMap<String, OwnedValue>)>()
+                    && path == **self.session
+                {
+                    self.state.activation(
+                        id,
+                        message
+                            .header()
+                            .member()
+                            .is_some_and(|member| member.as_str() == "Activated"),
+                        self.requested,
+                        self.actions,
+                    );
+                }
+            }
+            Some("ShortcutsChanged") => {
+                if let Ok((path, changed)) = message
+                    .body()
+                    .deserialize::<(ObjectPath, Vec<(String, HashMap<String, OwnedValue>)>)>()
+                    && path == **self.session
+                {
+                    self.refresh_grants(&changed);
+                }
+            }
+            Some("Closed")
+                if message
+                    .header()
+                    .path()
+                    .is_some_and(|path| *path == **self.session) =>
+            {
+                self.clear();
+                report_portal_unavailable(
+                    self.bindings,
+                    self.statuses,
+                    "The desktop's global-shortcut service closed this session",
+                );
+                return Some(PortalExit::Stopped);
+            }
+            _ => {}
+        }
+        None
+    }
 }
 
 fn report_portal_denied(bindings: &Bindings, statuses: &StatusReporter) {
@@ -1075,17 +1206,23 @@ mod tests {
 
     #[cfg(test)]
     mod portal_protocol_tests {
-        use std::{sync::Arc, time::Instant};
+        use std::{
+            sync::{Arc, mpsc},
+            time::Instant,
+        };
 
         use super::*;
 
-        struct FakePortal;
+        struct FakePortal {
+            version: u32,
+            list_requests: Option<mpsc::Sender<OwnedObjectPath>>,
+        }
 
         #[zbus::interface(name = "org.freedesktop.portal.GlobalShortcuts")]
         impl FakePortal {
             #[zbus(property, name = "version")]
             fn version(&self) -> u32 {
-                1
+                self.version
             }
 
             async fn create_session(
@@ -1140,20 +1277,44 @@ mod tests {
                     HashMap::from([("shortcuts", Value::from(bound))]),
                 )
                 .await;
-                let connection = connection.clone();
-                let (session, talk, toggle) = (
-                    session.clone(),
-                    shortcuts[0].0.clone(),
-                    shortcuts[1].0.clone(),
-                );
-                thread::spawn(move || {
-                    thread::sleep(Duration::from_millis(100));
-                    zbus::block_on(press(&connection, &session, &talk, "Activated"));
-                    thread::sleep(Duration::from_millis(100));
-                    zbus::block_on(press(&connection, &session, &talk, "Deactivated"));
-                    zbus::block_on(press(&connection, &session, &toggle, "Activated"));
-                    zbus::block_on(press(&connection, &session, &toggle, "Activated"));
-                });
+                if self.version < 2 {
+                    let connection = connection.clone();
+                    let (session, talk, toggle) = (
+                        session.clone(),
+                        shortcuts[0].0.clone(),
+                        shortcuts[1].0.clone(),
+                    );
+                    thread::spawn(move || {
+                        thread::sleep(Duration::from_millis(100));
+                        zbus::block_on(press(&connection, &session, &talk, "Activated"));
+                        thread::sleep(Duration::from_millis(100));
+                        zbus::block_on(press(&connection, &session, &talk, "Deactivated"));
+                        zbus::block_on(press(&connection, &session, &toggle, "Activated"));
+                        zbus::block_on(press(&connection, &session, &toggle, "Activated"));
+                    });
+                }
+                request
+            }
+            async fn configure_shortcuts(
+                &self,
+                _session: OwnedObjectPath,
+                _parent_window: String,
+                _options: HashMap<String, OwnedValue>,
+                #[zbus(header)] header: zbus::message::Header<'_>,
+            ) -> OwnedObjectPath {
+                request_path_with_token(&header, "configure")
+            }
+
+            async fn list_shortcuts(
+                &self,
+                _session: OwnedObjectPath,
+                options: HashMap<String, OwnedValue>,
+                #[zbus(header)] header: zbus::message::Header<'_>,
+            ) -> OwnedObjectPath {
+                let request = request_path(&header, &options);
+                if let Some(requests) = &self.list_requests {
+                    requests.send(request.clone()).unwrap();
+                }
                 request
             }
         }
@@ -1162,14 +1323,21 @@ mod tests {
             header: &zbus::message::Header<'_>,
             options: &HashMap<String, OwnedValue>,
         ) -> OwnedObjectPath {
+            let Some(Value::Str(token)) = options.get("handle_token").map(|v| &**v) else {
+                panic!("no handle token");
+            };
+            request_path_with_token(header, token)
+        }
+
+        fn request_path_with_token(
+            header: &zbus::message::Header<'_>,
+            token: &str,
+        ) -> OwnedObjectPath {
             let sender = header
                 .sender()
                 .unwrap()
                 .trim_start_matches(':')
                 .replace('.', "_");
-            let Some(Value::Str(token)) = options.get("handle_token").map(|v| &**v) else {
-                panic!("no handle token");
-            };
             OwnedObjectPath::try_from(format!("{PATH}/request/{sender}/{token}")).unwrap()
         }
 
@@ -1214,11 +1382,33 @@ mod tests {
         fn all_grants(
             leave: HashMap<String, OwnedValue>,
         ) -> Vec<(String, HashMap<String, OwnedValue>)> {
+            all_grants_with_talk("V", leave)
+        }
+
+        fn all_grants_with_talk(
+            talk: &str,
+            leave: HashMap<String, OwnedValue>,
+        ) -> Vec<(String, HashMap<String, OwnedValue>)> {
             vec![
-                (TALK_ID.to_owned(), granted("V")),
+                (TALK_ID.to_owned(), granted(talk)),
                 (STREAM_ID.to_owned(), granted("CTRL+C")),
                 (LEAVE_ID.to_owned(), leave),
             ]
+        }
+
+        fn list_results(description: &'static str) -> HashMap<&'static str, Value<'static>> {
+            let shortcuts = vec![
+                (
+                    TALK_ID.to_owned(),
+                    HashMap::from([("trigger_description".to_owned(), Value::from(description))]),
+                ),
+                (
+                    STREAM_ID.to_owned(),
+                    HashMap::from([("trigger_description".to_owned(), Value::from("CTRL+C"))]),
+                ),
+                (LEAVE_ID.to_owned(), HashMap::new()),
+            ];
+            HashMap::from([("shortcuts", Value::from(shortcuts))])
         }
 
         async fn shortcuts_changed(
@@ -1234,6 +1424,13 @@ mod tests {
                     "ShortcutsChanged",
                     &(session, shortcuts),
                 )
+                .await
+                .unwrap();
+        }
+
+        async fn close_session(connection: &Connection, session: &OwnedObjectPath) {
+            connection
+                .emit_signal(None::<()>, session, SHORTCUTS, "Closed", &())
                 .await
                 .unwrap();
         }
@@ -1259,7 +1456,13 @@ mod tests {
                 .unwrap()
                 .name(PORTAL)
                 .unwrap()
-                .serve_at(PATH, FakePortal)
+                .serve_at(
+                    PATH,
+                    FakePortal {
+                        version: 1,
+                        list_requests: None,
+                    },
+                )
                 .unwrap()
                 .build()
                 .unwrap();
@@ -1350,6 +1553,163 @@ mod tests {
             assert!(
                 !watcher.configure_shortcuts(),
                 "a live version-1 portal cannot open the version-2 editor"
+            );
+            drop(server);
+        }
+
+        #[test]
+        #[ignore = "needs a private session bus and a Wayland session"]
+        fn v2_list_wait_processes_session_signals() {
+            assert!(
+                is_wayland_session(),
+                "set WAYLAND_DISPLAY or XDG_SESSION_TYPE=wayland for the private portal scenario"
+            );
+            yapfast_core::push_to_talk::hold(false);
+            yapfast_core::push_to_talk::set_on(true);
+            yapfast_core::push_to_talk::set_release_delay(0);
+
+            let (list_requests, requested_lists) = mpsc::channel();
+            let server = zbus::blocking::connection::Builder::session()
+                .unwrap()
+                .name(PORTAL)
+                .unwrap()
+                .serve_at(
+                    PATH,
+                    FakePortal {
+                        version: 2,
+                        list_requests: Some(list_requests),
+                    },
+                )
+                .unwrap()
+                .build()
+                .unwrap();
+            let bindings = Bindings {
+                talk: Some(key(47, Some("v"))),
+                toggle_stream: Some(Chord {
+                    key: key(46, Some("c")),
+                    modifiers: crate::push_to_talk::ModifierMask::CTRL,
+                }),
+                leave_voice: Some(Chord {
+                    key: key(45, Some("x")),
+                    modifiers: crate::push_to_talk::ModifierMask::ALT,
+                }),
+            };
+            let commands = Arc::new(Mutex::new(Vec::new()));
+            let heard_commands = commands.clone();
+            let statuses = Arc::new(Mutex::new(Vec::new()));
+            let heard_statuses = statuses.clone();
+            let runtime = BackgroundRuntime::new().unwrap();
+            let watcher = crate::push_to_talk::Watcher::start(
+                bindings,
+                &runtime,
+                move |command| heard_commands.lock().unwrap().push(command),
+                move |binding, reach| heard_statuses.lock().unwrap().push((binding, reach)),
+            );
+            watcher.set_commands_enabled(true);
+            wait_status(&watcher, Binding::Talk, Reach::Everywhere(Some("V".into())));
+            let session = OwnedObjectPath::try_from(format!("{PATH}/session/test/1")).unwrap();
+            zbus::block_on(press(server.inner(), &session, TALK_ID, "Activated"));
+            wait_held(true);
+            assert!(yapfast_core::push_to_talk::sending());
+
+            assert!(watcher.configure_shortcuts());
+            let first_list = requested_lists
+                .recv_timeout(Duration::from_secs(2))
+                .expect("the portal did not request its first shortcut list");
+            zbus::block_on(press(server.inner(), &session, TALK_ID, "Deactivated"));
+            zbus::block_on(press(server.inner(), &session, STREAM_ID, "Activated"));
+            zbus::block_on(press(server.inner(), &session, STREAM_ID, "Activated"));
+            zbus::block_on(shortcuts_changed(
+                server.inner(),
+                &session,
+                all_grants_with_talk("SHIFT+V", granted("ALT+X")),
+            ));
+            wait_held(false);
+            assert!(!yapfast_core::push_to_talk::sending());
+            wait_status(
+                &watcher,
+                Binding::Talk,
+                Reach::Everywhere(Some("SHIFT+V".into())),
+            );
+            assert_eq!(commands.lock().unwrap().as_slice(), [Command::ToggleStream]);
+
+            zbus::block_on(respond(
+                server.inner(),
+                &first_list,
+                list_results("SHIFT+V"),
+            ));
+            assert!(watcher.configure_shortcuts());
+            let second_list = requested_lists
+                .recv_timeout(Duration::from_secs(2))
+                .expect("the portal did not request its second shortcut list");
+            zbus::block_on(press(server.inner(), &session, TALK_ID, "Activated"));
+            wait_held(true);
+            assert!(yapfast_core::push_to_talk::sending());
+
+            let release_reply = zbus::block_on(server.inner().call_method(
+                Some("org.freedesktop.DBus"),
+                "/org/freedesktop/DBus",
+                Some("org.freedesktop.DBus"),
+                "ReleaseName",
+                &(PORTAL,),
+            ))
+            .unwrap();
+            assert_eq!(release_reply.body().deserialize::<u32>().unwrap(), 1);
+            wait_held(false);
+            assert!(!yapfast_core::push_to_talk::sending());
+            wait_status(
+                &watcher,
+                Binding::Talk,
+                Reach::Focused("The desktop's global-shortcut service restarted"),
+            );
+
+            let request_reply = zbus::block_on(server.inner().call_method(
+                Some("org.freedesktop.DBus"),
+                "/org/freedesktop/DBus",
+                Some("org.freedesktop.DBus"),
+                "RequestName",
+                &(PORTAL, 0u32),
+            ))
+            .unwrap();
+            assert_eq!(request_reply.body().deserialize::<u32>().unwrap(), 1);
+            wait_status(
+                &watcher,
+                Binding::Talk,
+                Reach::Focused("The desktop's global-shortcut service closed this session"),
+            );
+            // An old list response from the restarted service must not restore its grants.
+            zbus::block_on(respond(server.inner(), &second_list, list_results("STALE")));
+            wait_status(&watcher, Binding::Talk, Reach::Everywhere(Some("V".into())));
+            let stale_grant = Reach::Everywhere(Some("STALE".into()));
+            assert!(
+                !statuses
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(binding, reach)| { *binding == Binding::Talk && reach == &stale_grant }),
+                "a stale ListShortcuts response restored a grant after the portal restarted"
+            );
+
+            assert!(watcher.configure_shortcuts());
+            let _third_list = requested_lists
+                .recv_timeout(Duration::from_secs(2))
+                .expect("the portal did not request its third shortcut list");
+            zbus::block_on(press(server.inner(), &session, TALK_ID, "Activated"));
+            wait_held(true);
+            assert!(yapfast_core::push_to_talk::sending());
+            zbus::block_on(close_session(server.inner(), &session));
+            wait_held(false);
+            assert!(!yapfast_core::push_to_talk::sending());
+            wait_status(
+                &watcher,
+                Binding::Talk,
+                Reach::Focused("The desktop's global-shortcut service closed this session"),
+            );
+
+            drop(watcher);
+            yapfast_core::push_to_talk::set_on(false);
+            yapfast_core::push_to_talk::set_release_delay(
+                yapfast_core::push_to_talk::DEFAULT_RELEASE_DELAY,
             );
             drop(server);
         }

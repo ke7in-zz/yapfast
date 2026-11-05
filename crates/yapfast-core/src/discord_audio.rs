@@ -1150,7 +1150,7 @@ mod tests {
             }]);
             let (_, frames_before_stream) = received_video_summary(server);
             commands.send(Command::ToggleGameStream).unwrap();
-            tokio::time::timeout(
+            let streaming = tokio::time::timeout(
                 Duration::from_secs(40),
                 states.wait_for(|state| {
                     state
@@ -1159,9 +1159,17 @@ mod tests {
                         .is_some_and(|sharing| sharing.phase == SharePhase::Live)
                 }),
             )
-            .await
-            .expect("recognized game did not stream")
-            .unwrap();
+            .await;
+            if streaming.is_err() {
+                drop(streaming);
+                let state = states.borrow();
+                panic!(
+                    "recognized game did not stream: error={:?}, sharing_started={}",
+                    state.error,
+                    state.sharing.is_some()
+                );
+            }
+            streaming.unwrap().unwrap();
             wait_for_received_video_frames(server.to_owned(), frames_before_stream).await;
 
             commands.send(Command::ToggleGameStream).unwrap();

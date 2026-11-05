@@ -57,12 +57,18 @@
     in {
       # scripts/package-linux.py copies the notices of Skia's third-party
       # code from here; the prebuilt Linux archive carries only Skia's own.
-      packages.${system}.skia-source = pkgs.symlinkJoin {
-        name = "yapfast-skia-0.153.3-linux-source";
-        paths = [ windowsSkiaSource ] ++ map (dep: pkgs.runCommand "yapfast-skia-${dep.name}" {} ''
-          mkdir -p "$out/third_party/externals/${dep.name}"
-          cp -r ${dep.source}/. "$out/third_party/externals/${dep.name}/"
-        '') linuxSkiaDependencies;
+      packages.${system} = {
+        skia-source = pkgs.symlinkJoin {
+          name = "yapfast-skia-0.153.3-linux-source";
+          paths = [ windowsSkiaSource ] ++ map (dep: pkgs.runCommand "yapfast-skia-${dep.name}" {} ''
+            mkdir -p "$out/third_party/externals/${dep.name}"
+            cp -r ${dep.source}/. "$out/third_party/externals/${dep.name}/"
+          '') linuxSkiaDependencies;
+        };
+        # The private session bus used by scripts/check's portal protocol test.
+        portal-test-bus = pkgs.dbus;
+        # Private null-only audio for the recognized-game voice integration.
+        game-stream-test-audio = pkgs.pulseaudio;
       };
       devShells.${system} = {
         default = pkgs.mkShell {

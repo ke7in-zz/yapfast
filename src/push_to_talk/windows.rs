@@ -100,6 +100,7 @@ impl Input {
             original: None,
             target: None,
             subclass_installed: false,
+            input_sink: false,
             wts_registered: false,
             win_event_hook: None,
             power_notification: None,
