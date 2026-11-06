@@ -5,7 +5,7 @@ let
     gst_all_1.gstreamer gst_all_1.gst-plugins-base gst_all_1.gst-plugins-good
     gst_all_1.gst-plugins-bad gst_all_1.gst-libav ];
 in environment.devShells.x86_64-linux.default.overrideAttrs (previous: {
-  buildInputs = previous.buildInputs ++ libraries ++ (with pkgs; [ weston pulseaudio alsa-plugins ffmpeg ]);
+  buildInputs = previous.buildInputs ++ libraries ++ (with pkgs; [ weston pulseaudio alsa-plugins ]);
   LD_LIBRARY_PATH = previous.LD_LIBRARY_PATH + ":" + pkgs.lib.makeLibraryPath libraries;
   GST_PLUGIN_SYSTEM_PATH_1_0 = pkgs.lib.makeSearchPath "lib/gstreamer-1.0" libraries;
   YAPFAST_FRAMEWORK_ALSA_PLUGINS = "${pkgs.alsa-plugins}/lib/alsa-lib";

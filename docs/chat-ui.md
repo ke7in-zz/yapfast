@@ -63,10 +63,12 @@ errors make it taller than the minimum window. SSO and OAuth are still pending.
   ONLINE and OFFLINE, with counts, avatars, status dots, role colours,
   custom statuses, and a red clock beside someone timed out. Yapfast subscribes to the list's
   first 100 rows while the channel is open, and Discord keeps them current.
-- Read live text messages. Earlier history loads as the timeline scrolls
-  within a screen of its top, a page at a time (30 events for Matrix, 50
-  messages for Discord), until the conversation's first message, which "This
-  is the start of #general." marks. While a page is on its way a pill above
+- Read live text messages. Earlier history loads once the timeline has
+  stayed within a screen of its top for 50 ms, a page at a time (30 events
+  for Matrix, 50 messages for Discord), until the conversation's first
+  message, which "This is the start of #general." marks. A room opening
+  shows its list at the top for a moment, before it moves to the newest
+  message or the "New" divider, and that moment loads nothing. While a page is on its way a pill above
   the oldest message says "Loading earlier messages..."; if it fails, the pill
   offers Retry, and pages load again only when asked. The messages shown
   stay where they are on screen as older ones go in above them, even when
@@ -130,8 +132,12 @@ errors make it taller than the minimum window. SSO and OAuth are still pending.
 - A GIF picker next to the emoji button, on Discord: a search over Klipy,
   trending terms and favourites, as in Discord's client. A click sends a GIF,
   Shift and a click puts it in the message, and a star keeps it among the
-  favourites; GIFs and moving pictures in messages have the star too. See
-  [Discord](discord/messages.md#gifs).
+  favourites; GIFs and moving pictures in messages have the star too. Its left
+  edge drags it wider, as Discord's does: the right edge and the height stay,
+  the grid fits another column for every 212px, and the edge stops 8px past
+  the server list. The Emoji tab keeps the 498px the picker opens at. A drag
+  that changed the width keeps it in `layout.json` (`gif_picker_width`), and
+  it comes back at the next start. See [Discord](discord/messages.md#gifs).
 - GIFs, animated emoji, stickers and the picker's tiles play only while
   Yapfast's window has the focus, as in Discord: on another screen they hold
   still on the frame they were showing, and go on from there when the
@@ -180,11 +186,20 @@ errors make it taller than the minimum window. SSO and OAuth are still pending.
   X to take each out, until the message is sent; text can be typed beside
   them, and the message may be the files alone. A message carries up to ten
   files. Each must fit the conversation's limit, and a file that doesn't is
-  refused with its size and the limit. On Wayland the clipboard is read
-  through the data-control protocol, so a picture keeps its copied bytes and a
-  GIF stays animated; elsewhere arboard reads it, and pixels are saved as PNG.
-  Pasted pictures are saved as `image.png` in a temporary folder removed when
-  Yapfast closes. Text on the clipboard pastes as text. A right click in the
+  refused with its size and the limit. A pasted picture keeps the bytes it
+  was copied as, PNG, GIF, WebP or JPEG in that order of preference, so a GIF
+  stays animated. Wayland's clipboard is read through the data-control
+  protocol, and X11's by asking the CLIPBOARD selection's owner, taking large
+  pictures in parts (INCR). Windows apps offer a picture under a name they
+  register, "PNG", "GIF", "JFIF" or the MIME type, which Yapfast takes when
+  the bytes are of that type; one copied only as a bitmap (`CF_DIB` or
+  `CF_DIBV5`, whichever the app put) is decoded by Yapfast and saved as PNG,
+  keeping alpha in a 32-bit bitmap's fourth byte as Chromium writes it, and
+  opaque when that byte is zero throughout. On X11 and Windows, text on the
+  clipboard wins over a picture beside it, since office suites put a picture
+  of the cells or text they copy there too. Pasted pictures are saved as
+  `image.<extension>` in a temporary folder removed when Yapfast closes. Text
+  on the clipboard pastes as text. A right click in the
   composer opens Discord's menu for the field, without its spelling
   suggestions: Cut and Copy while text is selected, Paste, which pastes as
   Ctrl+V does, and Select All, which Discord's lacks. A thread's composer

@@ -31,9 +31,14 @@ export CARGO_ENCODED_RUSTFLAGS
 yapfast_target_flags=${yapfast_release_target//-/_}
 if [[ "$yapfast_release_target" == *-windows-msvc ]]; then
   eval "$(cargo xwin env --target "$yapfast_release_target")"
+  # thorvg-sys passes bindgen a Linux target, which cannot parse the MSVC headers.
+  # Override it last; the Windows CRT also requires Clang's MS extensions.
+  yapfast_bindgen="BINDGEN_EXTRA_CLANG_ARGS_$yapfast_target_flags"
+  export "$yapfast_bindgen=${!yapfast_bindgen:-} --target=$yapfast_release_target"
+  export BINDGEN_EXTRA_CLANG_ARGS="${BINDGEN_EXTRA_CLANG_ARGS:-} --target=$yapfast_release_target -fms-extensions"
 fi
 yapfast_cflags="CFLAGS_$yapfast_target_flags" yapfast_cxxflags="CXXFLAGS_$yapfast_target_flags"
 export "$yapfast_cflags=${!yapfast_cflags:-} ${yapfast_c[*]}"
 export "$yapfast_cxxflags=${!yapfast_cxxflags:-} ${yapfast_c[*]}"
 unset yapfast_release_target yapfast_root yapfast_maps yapfast_rust yapfast_c map \
-  yapfast_target_flags yapfast_cflags yapfast_cxxflags
+  yapfast_target_flags yapfast_cflags yapfast_cxxflags yapfast_bindgen

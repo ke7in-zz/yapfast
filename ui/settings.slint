@@ -428,6 +428,40 @@ export component AccountSettings inherits VerticalLayout {
     }
 }
 
+component CommandKeybind inherits VerticalLayout {
+    in property <string> label;
+    in property <string> shortcut;
+    in property <string> note;
+    in property <bool> recording;
+    callback record(bool);
+    callback clear;
+    spacing: 8px;
+    Text { text: root.label; color: Theme.text; font-size: 14px; font-weight: 600; }
+    HorizontalLayout {
+        spacing: 8px; alignment: start;
+        Rectangle {
+            width: 200px; height: 36px; border-radius: 8px; background: Theme.sunken;
+            border-width: root.recording ? 2px : 0px; border-color: Theme.accent;
+            accessible-role: text; accessible-label: root.label + " keybind";
+            accessible-value: root.shortcut == "" ? "No keybind set" : root.shortcut;
+            Text {
+                x: 12px; width: parent.width - 24px; overflow: elide; font-size: 14px;
+                text: root.recording ? "Press and release keys..." : root.shortcut == "" ? "No keybind set" : root.shortcut;
+                color: root.recording || root.shortcut == "" ? Theme.muted : Theme.text;
+            }
+        }
+        ActionButton {
+            text: root.recording ? "Cancel" : root.shortcut == "" ? "Record keybind" : "Edit keybind";
+            danger: root.recording;
+            clicked => { root.record(!root.recording); }
+        }
+        if root.shortcut != "": ActionButton {
+            text: "Clear"; clicked => { root.clear(); }
+        }
+    }
+    Label { text: root.recording ? "Hold the modifiers, then press and release a key. Escape or leaving this window cancels." : root.note; }
+}
+
 // Settings: the audio devices and camera, and how calls start and sound.
 export component VoiceSettings inherits VerticalLayout {
     in property <[string]> microphones;
@@ -469,6 +503,12 @@ export component VoiceSettings inherits VerticalLayout {
     in-out property <int> talk-delay: 20;
     /// Where the key works: in every app, or only in Yapfast and why.
     in property <string> talk-note;
+    in property <string> toggle-stream-key;
+    in property <string> leave-voice-key;
+    in property <string> toggle-stream-note;
+    in property <string> leave-voice-note;
+    in property <int> hotkey-recording;
+    in property <bool> hotkeys-desktop;
     /// Discord is linked, so its calls' noise suppression shows.
     in property <bool> discord;
     /// How loud every call sends the microphone and plays, as sliders'
@@ -502,6 +542,9 @@ export component VoiceSettings inherits VerticalLayout {
     callback preferences-changed;
     /// Starts or stops recording the push-to-talk key.
     callback record-talk-key(bool);
+    callback record-hotkey(int);
+    callback clear-hotkey(int);
+    callback configure-hotkeys;
     spacing: 16px;
     SettingsTitle { text: "Voice & video"; }
     // Each row's two columns take half the width each, whatever is in them:
@@ -662,6 +705,28 @@ export component VoiceSettings inherits VerticalLayout {
         description: "For a bare or echoey room that makes your voice sound far away. Uses a little more processing, and your voice goes out 10 ms later.";
         checked <=> root.dereverb;
         toggled => { root.preferences-changed(); }
+    }
+    VerticalLayout {
+        spacing: 12px;
+        SettingsHeading { text: "GLOBAL VOICE SHORTCUTS"; }
+        Label { text: "Control your current call while Yapfast is minimized or another app is in front. Shortcuts are independent of push to talk. On Windows and X11 the key's physical position is used, and the other app may also receive the shortcut."; }
+        if root.discord: CommandKeybind {
+            label: "Toggle game stream"; shortcut: root.toggle-stream-key;
+            note: root.toggle-stream-note; recording: root.hotkey-recording == 1;
+            record(on) => { root.record-hotkey(on ? 1 : 0); }
+            clear => { root.clear-hotkey(1); }
+        }
+        if root.discord: Label { text: "Starts only a recognized running game's window, including Steam games. Audio includes sound from other applications. If a stream is already running, stops it. Automatic game targeting isn't available on Wayland."; }
+        CommandKeybind {
+            label: "Leave voice channel"; shortcut: root.leave-voice-key;
+            note: root.leave-voice-note; recording: root.hotkey-recording == 2;
+            record(on) => { root.record-hotkey(on ? 2 : 0); }
+            clear => { root.clear-hotkey(2); }
+        }
+        if root.hotkeys-desktop: ActionButton {
+            text: "Desktop shortcut settings";
+            clicked => { root.configure-hotkeys(); }
+        }
     }
     VerticalLayout {
         spacing: 8px;
@@ -1186,14 +1251,23 @@ export component AdvancedSettings inherits VerticalLayout {
     in-out property <bool> multiple-windows;
     in-out property <bool> start-on-sign-in;
     in property <bool> autostart-available;
+    in-out property <bool> discord-links;
+    in property <bool> discord-links-available;
     callback preferences-changed;
     callback restart;
     spacing: 16px;
     SettingsTitle { text: "Advanced"; }
+
     if root.autostart-available: SettingsSwitch {
         text: "Start when you sign in";
         description: "Yapfast starts in the system tray when you sign in to your computer, so messages and calls reach you.";
         checked <=> root.start-on-sign-in;
+        toggled => { root.preferences-changed(); }
+    }
+    if root.discord-links-available: SettingsSwitch {
+        text: "Open Discord links in Yapfast";
+        description: "discord:// links from other apps and shortcuts open here instead of Discord. Turning it off gives them back to the app that had them.";
+        checked <=> root.discord-links;
         toggled => { root.preferences-changed(); }
     }
     SettingsSwitch {

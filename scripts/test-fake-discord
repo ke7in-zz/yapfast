@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Runs crates/yapfast-discord/tests/fake_server.rs, then yapfast-core's ignored
-# discord_text tests, against testing/fake_discord.ts, then
-# crates/yapfast-discord/tests/fake_env.rs against it with an environment.
+# Runs crates/yapfast-discord/tests/fake_server.rs, yapfast-core's ignored
+# discord_text and recognized-game stream tests against testing/fake_discord.ts,
+# then crates/yapfast-discord/tests/fake_env.rs against an example environment.
 # Usage: scripts/test-fake-discord [FILTER…], test names or parts of them
 # (`scripts/test-fake-discord forum`), passed to each test binary.
 # Each fake_server.rs test starts a fake of its own, logging to
@@ -14,6 +14,8 @@
 # target/fake-discord.log. Then it does the same for fake_env.rs, against
 # a fake running testing/envs/example.json, whose log is
 # target/fake-discord-env.log.
+# The game-stream tests share a private, null-only PulseAudio server; each gets
+# a fake of its own.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
@@ -23,9 +25,26 @@ fi
 
 mkdir -p target
 fakes=()
-# Stops every fake: a stopped one's status fails `wait`, which mustn't end
-# the trap before the next.
-trap 'for fake in "${fakes[@]}"; do kill "$fake" 2>/dev/null || true; wait "$fake" 2>/dev/null || true; done' EXIT
+pulse_dir=
+pulse_pid=
+pulse_tools=
+# Stop every fake and the private audio server; a stopped fake's status fails
+# `wait`, which mustn't end the trap before the next.
+cleanup() {
+  if [[ -n $pulse_pid ]]; then
+    PULSE_SERVER="$pulse_server" "$pulse_tools/bin/pactl" exit >/dev/null 2>&1 || true
+    kill "$pulse_pid" 2>/dev/null || true
+    wait "$pulse_pid" 2>/dev/null || true
+  fi
+  for fake in "${fakes[@]}"; do
+    kill "$fake" 2>/dev/null || true
+    wait "$fake" 2>/dev/null || true
+  done
+  if [[ $pulse_dir == /tmp/yapfast-null-audio.* && -d $pulse_dir && ! -L $pulse_dir ]]; then
+    rm -rf -- "$pulse_dir"
+  fi
+}
+trap cleanup EXIT
 
 # Starts the fake on a free port, logging to the file given first, with the
 # other arguments, and waits until it answers; sets $server to its address.
@@ -57,6 +76,46 @@ start_fake() {
   server="http://127.0.0.1:$port"
 }
 
+start_null_audio() {
+  pulse_dir=$(mktemp -d /tmp/yapfast-null-audio.XXXXXXXX)
+  pulse_tools=$(nix build path:./nix#game-stream-test-audio --no-link --print-out-paths)
+  chmod 700 "$pulse_dir"
+  mkdir -p "$pulse_dir/home" "$pulse_dir/run"
+  chmod 700 "$pulse_dir/home" "$pulse_dir/run"
+  pulse_server="unix:$pulse_dir/run/native"
+  HOME="$pulse_dir/home" XDG_RUNTIME_DIR="$pulse_dir/run" \
+    "$pulse_tools/bin/pulseaudio" --daemonize=no --exit-idle-time=-1 --disable-shm -n \
+      -L "module-native-protocol-unix socket=$pulse_dir/run/native auth-anonymous=1" \
+      -L "module-null-sink sink_name=yapfast_hotkey_output" \
+      -L "module-null-sink sink_name=yapfast_hotkey_input" \
+      >target/fake-discord-pulse.log 2>&1 &
+  pulse_pid=$!
+  for _ in $(seq 100); do
+    if PULSE_SERVER="$pulse_server" "$pulse_tools/bin/pactl" info >/dev/null 2>&1; then
+      break
+    fi
+    if ! kill -0 "$pulse_pid" 2>/dev/null; then
+      echo "Private PulseAudio exited before its null sinks were ready; see target/fake-discord-pulse.log" >&2
+      return 1
+    fi
+    sleep 0.1
+  done
+  if ! PULSE_SERVER="$pulse_server" "$pulse_tools/bin/pactl" info >/dev/null 2>&1; then
+    echo "Private PulseAudio did not answer; see target/fake-discord-pulse.log" >&2
+    return 1
+  fi
+  local sinks sources
+  mapfile -t sinks < <(PULSE_SERVER="$pulse_server" "$pulse_tools/bin/pactl" list short sinks)
+  mapfile -t sources < <(PULSE_SERVER="$pulse_server" "$pulse_tools/bin/pactl" list short sources)
+  if [[ ${#sinks[@]} -ne 2 || ${#sources[@]} -ne 2 || \
+        ${sinks[*]} != *yapfast_hotkey_output* || ${sinks[*]} != *yapfast_hotkey_input* || \
+        ${sources[*]} != *yapfast_hotkey_output.monitor* || ${sources[*]} != *yapfast_hotkey_input.monitor* ]]; then
+    echo "Private PulseAudio did not expose only its two null sinks and monitors" >&2
+    printf '%s\n' "${sinks[@]}" "${sources[@]}" >&2
+    return 1
+  fi
+}
+
 if command -v cargo-nextest >/dev/null; then
   cargo nextest run --locked --cargo-profile fast -p yapfast-discord --test fake_server \
     --run-ignored only --no-fail-fast "$@"
@@ -71,3 +130,39 @@ YAPFAST_DISCORD_TEST_SERVER=$server \
 start_fake target/fake-discord-env.log --env testing/envs/example.json
 YAPFAST_DISCORD_TEST_SERVER=$server \
   cargo test --locked --profile fast -p yapfast-discord --test fake_env -- --ignored "$@"
+
+game_stream_tests=(
+  discord_audio::tests::game_stream_hotkey_fails_closed_and_toggles_only_a_recognized_game
+  discord_audio::tests::pending_game_stream_scan_is_cancelled_by_stop_toggle_and_leave
+)
+selected_game_stream_tests=()
+for game_stream_test in "${game_stream_tests[@]}"; do
+  if (( $# == 0 )); then
+    selected_game_stream_tests+=("$game_stream_test")
+    continue
+  fi
+  for filter in "$@"; do
+    if [[ $game_stream_test == *"$filter"* ]]; then
+      selected_game_stream_tests+=("$game_stream_test")
+      break
+    fi
+  done
+done
+if (( ${#selected_game_stream_tests[@]} > 0 )); then
+  CARGO_BUILD_JOBS=2 cargo build --locked --profile fast -p yapfast
+  start_null_audio
+  for game_stream_test in "${selected_game_stream_tests[@]}"; do
+    # A fake keeps the streams it received, so each test gets one of its own.
+    start_fake "target/fake-discord-${game_stream_test##*::}.log"
+    PULSE_SERVER="$pulse_server" \
+    PULSE_SINK=yapfast_hotkey_output \
+    PULSE_SOURCE=yapfast_hotkey_input.monitor \
+    YAPFAST_DISCORD_TEST_SERVER="$server" \
+    YAPFAST_DISCORD_GAMES_FILE=/dev/null \
+    YAPFAST_STREAM_WORKER="$PWD/target/fast/yapfast" \
+    YAPFAST_STREAM_TEST_PATTERN=1 \
+      env -u DISPLAY -u WAYLAND_DISPLAY -u XDG_SESSION_TYPE \
+        CARGO_BUILD_JOBS=2 cargo test --locked --profile fast -p yapfast-core \
+          "$game_stream_test" -- --ignored --exact --test-threads=1
+  done
+fi

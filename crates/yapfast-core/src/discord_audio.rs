@@ -1069,7 +1069,7 @@ mod tests {
         // A beep isn't speech, but it's loud enough to open the gate anyway
         // with the suppressor off, which would take a steady tone out.
         crate::noise::set(crate::noise::Suppressor::Off);
-        let call = in_the_lounge(async |server| {
+        let call = in_the_lounge(true, async |server, _, _| {
             tokio::task::spawn_blocking(beep).await.unwrap();
             tokio::time::sleep(Duration::from_millis(500)).await;
             newest(&spoken(server))
@@ -1090,7 +1090,7 @@ mod tests {
         crate::noise::set(crate::noise::Suppressor::Off);
         crate::push_to_talk::set_on(true);
         crate::push_to_talk::set_release_delay(crate::push_to_talk::DEFAULT_RELEASE_DELAY);
-        let (up, held) = in_the_lounge(async |server| {
+        let (up, held) = in_the_lounge(true, async |server, _, _| {
             tokio::task::spawn_blocking(beep).await.unwrap();
             tokio::time::sleep(Duration::from_millis(500)).await;
             let up = newest(&spoken(server));
@@ -1113,9 +1113,178 @@ mod tests {
         assert_eq!(held["speaking"], 0, "it should say it stopped with the key");
     }
 
-    /// Joins the fake Discord's Lounge, unmutes, runs `during` with the
-    /// fake's address, and leaves.
-    fn in_the_lounge<T>(during: impl AsyncFnOnce(&str) -> T) -> T {
+    /// A game-stream hotkey cannot turn a missing game into another source;
+    /// with a recognized running process it opens one stream and stops it.
+    /// Run alone with a fake call and private audio devices. On Linux, use
+    /// `YAPFAST_DISCORD_GAMES_FILE=/dev/null`, the built
+    /// `YAPFAST_STREAM_WORKER`, and `YAPFAST_STREAM_TEST_PATTERN=1`; the
+    /// session must not identify itself as Wayland.
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "needs fake Discord, private audio devices and the test-pattern stream worker"]
+    fn game_stream_hotkey_fails_closed_and_toggles_only_a_recognized_game() {
+        use crate::voice::{Command, SharePhase};
+        use yapfast_discord::game_detection::custom_games::{self, CustomGame};
+
+        in_the_lounge(false, async |server, commands, states| {
+            custom_games::set(Vec::new());
+            commands.send(Command::ToggleGameStream).unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                states.wait_for(|state| state.error.is_some()),
+            )
+            .await
+            .expect("game detection did not finish")
+            .unwrap();
+            assert!(states.borrow().sharing.is_none());
+            let (video_streams, _) = received_video_summary(server);
+            assert_eq!(
+                video_streams.len(),
+                0,
+                "an unrecognized game opened a video stream"
+            );
+
+            let executable = std::env::current_exe().unwrap();
+            custom_games::set(vec![CustomGame {
+                executable: executable.to_string_lossy().into_owned(),
+                name: "Yapfast test process".into(),
+            }]);
+            let (_, frames_before_stream) = received_video_summary(server);
+            commands.send(Command::ToggleGameStream).unwrap();
+            let streaming = tokio::time::timeout(
+                Duration::from_secs(40),
+                states.wait_for(|state| {
+                    state
+                        .sharing
+                        .as_ref()
+                        .is_some_and(|sharing| sharing.phase == SharePhase::Live)
+                }),
+            )
+            .await;
+            if streaming.is_err() {
+                drop(streaming);
+                let state = states.borrow();
+                panic!(
+                    "recognized game did not stream: error={:?}, sharing_started={}",
+                    state.error,
+                    state.sharing.is_some()
+                );
+            }
+            streaming.unwrap().unwrap();
+            wait_for_received_video_frames(server.to_owned(), frames_before_stream).await;
+
+            commands.send(Command::ToggleGameStream).unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                states.wait_for(|state| state.sharing.is_none()),
+            )
+            .await
+            .expect("second press did not stop the stream")
+            .unwrap();
+            wait_for_video_frames_to_stop(server.to_owned()).await;
+
+            commands.send(Command::ToggleGameStream).unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                states.wait_for(|state| state.sharing.is_some()),
+            )
+            .await
+            .expect("recognized game did not start again")
+            .unwrap();
+            commands.send(Command::StopLive).unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                states.wait_for(|state| state.sharing.is_none()),
+            )
+            .await
+            .expect("StopLive did not cancel the game stream")
+            .unwrap();
+            wait_for_video_frames_to_stop(server.to_owned()).await;
+        });
+        custom_games::set(Vec::new());
+    }
+
+    /// Cancelling a pending recognized-game scan cannot start a stream, and
+    /// leaving while it is pending ends the call without creating a stream.
+    /// Run alone with a fake call and private audio devices. On Linux, use
+    /// `YAPFAST_DISCORD_GAMES_FILE=/dev/null`, the built
+    /// `YAPFAST_STREAM_WORKER`, and `YAPFAST_STREAM_TEST_PATTERN=1`; the
+    /// session must not identify itself as Wayland.
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "needs fake Discord, private audio devices and the test-pattern stream worker"]
+    fn pending_game_stream_scan_is_cancelled_by_stop_toggle_and_leave() {
+        use crate::voice::Command;
+        use yapfast_discord::game_detection::custom_games::{self, CustomGame};
+
+        let server = in_the_lounge_with(false, false, async |server, commands, states| {
+            let executable = std::env::current_exe().unwrap();
+            custom_games::set(vec![CustomGame {
+                executable: executable.to_string_lossy().into_owned(),
+                name: "Yapfast cancellation test process".into(),
+            }]);
+            let recognized = tokio::task::spawn_blocking(yapfast_discord::game_detection::running)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                !recognized.is_empty(),
+                "the synthetic game was not recognized"
+            );
+
+            assert_pending_game_scan_cancelled(
+                server,
+                commands,
+                states,
+                Command::StopLive,
+                "StopLive",
+            )
+            .await;
+            assert_pending_game_scan_cancelled(
+                server,
+                commands,
+                states,
+                Command::ToggleGameStream,
+                "second ToggleGameStream",
+            )
+            .await;
+
+            commands.send(Command::ToggleGameStream).unwrap();
+            commands.send(Command::Leave).unwrap();
+            server.to_owned()
+        });
+        custom_games::set(Vec::new());
+
+        let (streams, frames) = received_video_summary(&server);
+        assert!(
+            streams.is_empty(),
+            "Leave created fake video streams: {streams:?}"
+        );
+        assert_eq!(frames, 0, "Leave sent fake video frames");
+    }
+
+    /// Joins the fake Discord's Lounge, optionally unmutes, runs `during` with
+    /// its address and the call's command/state channels, and leaves.
+    fn in_the_lounge<T>(
+        unmute: bool,
+        during: impl AsyncFnOnce(
+            &str,
+            &UnboundedSender<crate::voice::Command>,
+            &mut tokio::sync::watch::Receiver<crate::voice::State>,
+        ) -> T,
+    ) -> T {
+        in_the_lounge_with(unmute, true, during)
+    }
+
+    fn in_the_lounge_with<T>(
+        unmute: bool,
+        leave_after_during: bool,
+        during: impl AsyncFnOnce(
+            &str,
+            &UnboundedSender<crate::voice::Command>,
+            &mut tokio::sync::watch::Receiver<crate::voice::State>,
+        ) -> T,
+    ) -> T {
         use crate::voice::{Command, Phase, State};
         let server = yapfast_discord::client::test_server().expect("YAPFAST_DISCORD_TEST_SERVER");
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1161,9 +1330,13 @@ mod tests {
                     "the call didn't connect: {:?}",
                     states.borrow().error
                 );
-                commands.send(Command::Mute(false)).unwrap();
-                let result = during(server).await;
-                commands.send(Command::Leave).unwrap();
+                if unmute {
+                    commands.send(Command::Mute(false)).unwrap();
+                }
+                let result = during(server, &commands, &mut states).await;
+                if leave_after_during {
+                    commands.send(Command::Leave).unwrap();
+                }
                 result
             };
             tokio::pin!(call);
@@ -1172,11 +1345,175 @@ mod tests {
                 ended = &mut call => panic!("the call ended: {ended:?}"),
                 result = speak => result,
             };
-            call.await.unwrap();
+            tokio::time::timeout(Duration::from_secs(10), &mut call)
+                .await
+                .expect("the call did not finish after Leave")
+                .unwrap();
+            if !leave_after_during {
+                assert_eq!(
+                    states.borrow().phase,
+                    Phase::Leaving,
+                    "Leave did not end the call"
+                );
+                assert_no_late_game_stream(server, &mut states, "Leave").await;
+            }
             // Long enough for leaving to reach the fake before the process ends.
             tokio::time::sleep(Duration::from_millis(500)).await;
             result
         }))
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn assert_pending_game_scan_cancelled(
+        server: &str,
+        commands: &UnboundedSender<crate::voice::Command>,
+        states: &mut tokio::sync::watch::Receiver<crate::voice::State>,
+        cancellation: crate::voice::Command,
+        name: &str,
+    ) {
+        use crate::voice::Command;
+
+        if states.borrow().deafened {
+            commands.send(Command::Deafen(false)).unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                states.wait_for(|state| !state.deafened),
+            )
+            .await
+            .expect("the call did not undeafen between cancellation cases")
+            .unwrap();
+        }
+
+        // Queue the start and the cancellation together. The call loop
+        // handles them in order, so the cancellation normally arrives while
+        // the scan is still running; the scan's result must then be dropped.
+        commands.send(Command::ToggleGameStream).unwrap();
+        commands.send(cancellation).unwrap();
+        commands.send(Command::Deafen(true)).unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            states.wait_for(|state| state.deafened),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{name} cancellation was not processed"))
+        .unwrap();
+        let error = states.borrow().error.clone();
+        assert!(
+            error.is_none(),
+            "{name} failed before scan cancellation: {error:?}"
+        );
+
+        assert_no_late_game_stream(server, states, name).await;
+    }
+
+    async fn assert_no_late_game_stream(
+        server: &str,
+        states: &mut tokio::sync::watch::Receiver<crate::voice::State>,
+        cancelled_by: &str,
+    ) {
+        let until = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            {
+                let state = states.borrow();
+                assert!(
+                    state.sharing.is_none(),
+                    "{cancelled_by} allowed a cancelled scan to create a share"
+                );
+                assert!(
+                    !state
+                        .participants
+                        .iter()
+                        .any(|participant| participant.local && participant.streaming),
+                    "{cancelled_by} made the local participant LIVE"
+                );
+            }
+            let server = server.to_owned();
+            let (streams, frames) =
+                tokio::task::spawn_blocking(move || received_video_summary(&server))
+                    .await
+                    .unwrap();
+            assert!(
+                streams.is_empty(),
+                "{cancelled_by} created fake video stream identifiers: {streams:?}"
+            );
+            assert_eq!(frames, 0, "{cancelled_by} sent video frames to the fake");
+            if tokio::time::Instant::now() >= until {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    fn received_video_summary(server: &str) -> (Vec<String>, u64) {
+        use std::io::{Read, Write};
+        let address = server.trim_start_matches("http://").trim_end_matches('/');
+        let mut connection = std::net::TcpStream::connect(address).unwrap();
+        write!(
+            connection,
+            "GET /_control/video HTTP/1.0\r\nHost: {address}\r\n\r\n"
+        )
+        .unwrap();
+        let mut response = String::new();
+        connection.read_to_string(&mut response).unwrap();
+        let body = response.split_once("\r\n\r\n").unwrap().1;
+        let response = serde_json::from_str::<serde_json::Value>(body).unwrap();
+        let received = response["received"].as_array().unwrap();
+        let streams = received
+            .iter()
+            .map(|stream| stream["stream"].as_str().unwrap().to_owned())
+            .collect();
+        let frames = received
+            .iter()
+            .map(|stream| stream["frames"].as_u64().unwrap())
+            .sum::<u64>();
+        (streams, frames)
+    }
+
+    async fn wait_for_received_video_frames(server: String, after: u64) {
+        let until = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let server = server.clone();
+            let (_, frames) = tokio::task::spawn_blocking(move || received_video_summary(&server))
+                .await
+                .unwrap();
+            if frames > after {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "expected video frames to advance beyond {after}, found {frames}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn wait_for_video_frames_to_stop(server: String) {
+        let until = tokio::time::Instant::now() + Duration::from_secs(10);
+        let server_for_start = server.clone();
+        let (_, mut frames) =
+            tokio::task::spawn_blocking(move || received_video_summary(&server_for_start))
+                .await
+                .unwrap();
+        let mut unchanged_since = tokio::time::Instant::now();
+        loop {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let server = server.clone();
+            let (_, observed) =
+                tokio::task::spawn_blocking(move || received_video_summary(&server))
+                    .await
+                    .unwrap();
+            let now = tokio::time::Instant::now();
+            if observed != frames {
+                frames = observed;
+                unchanged_since = now;
+            } else if now.duration_since(unchanged_since) >= Duration::from_millis(500) {
+                return;
+            }
+            assert!(
+                now < until,
+                "video frames continued after stop: last count {frames}, observed {observed}"
+            );
+        }
     }
 
     /// What the fake heard from the newest call, the one with the highest

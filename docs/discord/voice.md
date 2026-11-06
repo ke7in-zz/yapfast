@@ -165,9 +165,15 @@ call's thread can't take in time is dropped, and the next one is a keyframe.
 The others' cameras arrive the same way round. Op 12 says who films on which
 SSRC, and Discord forwards a camera only to those who ask for it with op 15
 ("media sink wants"): `{"any": 0, "<video SSRC>": quality, "pixelCounts":
-{...}}`, quality from 0 to 100. Yapfast asks for each camera whose tile is in
-sight, at 100 for a tile at least 360 pixels tall and 50 for a smaller one,
-with the tile's pixels; for any other, 0. Frames come together as Go Live's
+{...}}`, quality from 0 to 100. The sender films at the quality asked of it, on a
+ladder Discord's clients work out from 1280×720: 100 is 1280×720 at up to
+2.5 Mbit/s, 90 896×504, 80 672×378, 70 640×360, 60 512×288, 50 416×234 at
+264 kbit/s, down to 20. Yapfast asks for each camera whose tile is in
+sight as Discord's desktop app does, with the tile's pixels: while more
+than one camera films, the tile in focus at 100; in a call with one other person, the first step larger
+than the tile, as far as all the cameras fit in 1280×720 together; in a
+larger call, the largest step at which they fit (90 for two cameras, 80
+for three). Any other camera, 0. Frames come together as Go Live's
 do (reordering, NACK, a PLI after a loss) and are decrypted with the
 sender's DAVE key. Whole frames go to one thread, `yapfast-discord-video`,
 which keeps an FFmpeg H264 or libvpx VP8 decoder on one thread for each
@@ -480,21 +486,101 @@ account, leave it out. `matrix_voice`'s
 `persistent_encrypted_voice_and_native_audio` checks it between two processes
 on the local stack.
 
-`src/push_to_talk.rs` hears the key in other apps where the desktop lets it:
+## Global voice shortcuts
 
-| Desktop | How | Checked |
-| --- | --- | --- |
-| Wayland | The xdg-desktop-portal GlobalShortcuts portal: Yapfast binds one shortcut, offering the key as its preferred trigger, and holds it from Activated to Deactivated. The desktop may ask to approve it or give it another key; settings show the shortcut it gave. KDE Plasma, Hyprland and GNOME from 48 have the portal | Against a stand-in portal on a private bus (`the_portal_binds_the_key_and_holds_it`); not on a real desktop |
-| X11 | XInput 2's raw key events on the root window, which come whatever window has the focus and leave the key to it | Under Xvfb, with xdotool typing (`x11_hears_the_key_whatever_has_the_focus`) |
-| Windows | A low-level keyboard hook (`WH_KEYBOARD_LL`) on a thread of its own, which sees the key's release, unlike `RegisterHotKey`, and passes every key on | Under Wine 10.0, with `SendInput` typing (`the_hook_hears_the_key_go_down_and_up`); not on real Windows, where Windows may keep keys typed into a program running as administrator, such as some games, from the hook, as Discord warns of its own |
+Settings → Voice & video has optional **Toggle game stream** and **Leave voice
+channel** shortcuts, with no defaults. Hold any modifiers, then press and
+release the main key to record a chord. Escape, Cancel, losing focus, closing
+Settings or leaving Voice & video keeps the previous binding. Duplicate voice
+chords and chords overlapping push to talk are rejected without clearing it.
 
-Where none of these works, as on a wlroots desktop such as Sway, which has no
-GlobalShortcuts, the window's own key events stand in, so the key works while
-Yapfast is in front, and settings say so, as Discord's browser client does.
-Losing the focus lets the key go. The watcher runs while push to talk is on and
-a key is set, in calls or not, and with the window closed to the tray: a thread
-blocked on the X server or in the hook's message loop, or the portal's task on
-the network runtime. The ignored tests above, and
-`push_to_talk_sends_only_while_the_key_is_held` against the fake Discord, which
-checks that beeps with the key up send nothing and with it held do, run by
-hand; see their comments for what each needs.
+Toggle starts only a recognized running game's own window on Windows or
+native X11, including games found through Steam. It never substitutes the
+foreground app, a monitor, an old source or a picker. If a stream is already
+running, it stops it instead; a second press while starting cancels the start.
+Stopping does not need a game to remain running. Audio includes sound from
+other applications, not just the game. See [Go Live](go-live.md) for game
+recognition and capture details.
+
+Automatic game-window targeting is unavailable on Wayland. The same shortcut
+can still stop an existing stream there, including one started through the
+normal Go Live controls; it cannot start a game stream.
+
+Leave disconnects the current local call immediately, without a confirmation
+or bringing the window forward. With no current call, either shortcut does
+nothing. Each command fires once per press, not on keyboard repeat, and is
+independent of push to talk.
+
+`src/push_to_talk.rs` shares one native input source for the configured
+bindings. Desktop policy still applies: permissions, reserved shortcuts,
+secure desktops cannot be overridden. Session locks are not observed on X11;
+see its row.
+
+| Desktop | Backend and limits |
+| --- | --- |
+| Wayland | In sessions identified by `WAYLAND_DISPLAY` or `XDG_SESSION_TYPE=wayland`, including Xwayland clients, one xdg-desktop-portal GlobalShortcuts session binds the configured action IDs and offers preferred triggers. Settings show actual grants and desktop-assigned keys, not an assumed assignment. Activated/Deactivated hold PTT and delimit command presses. The live desktop editor requires portal version 2; version 1 still supports the shortcuts, with assignments managed by the desktop. Without portal GlobalShortcuts, background commands are unavailable; the app does not report focused-only XInput as global support. On portal-owner loss, Yapfast clears grants and held keys and retries setup with capped backoff, including while no owner is present. Response 1 (user cancellation) is terminal; other nonzero setup responses, including code 2 during CreateSession or BindShortcuts, report service unavailable and retry with capped backoff rather than reporting a user decline. A nonzero ListShortcuts response does not discard current grants. |
+| X11 | XInput 2.1 raw key events on the root window, including while another client holds a keyboard grab. Keys also reach the focused app. Initial held keys and device changes are synchronized without synthesizing command presses. Session locks are not observed: raw events ignore keyboard grabs, so commands and PTT still fire while the screen is locked. A real desktop locker has not been tested. |
+| Windows | Commands use Winit's application-lifetime Raw Input receiver with `RIDEV_INPUTSINK`, including with no Yapfast window. A subclass of that receiver handles directly delivered session and suspend/resume messages; command availability requires the subclass and notification registrations. PTT-only global-hook mode also installs session, power and desktop-switch monitors without enabling the raw-input sink; if monitoring is unavailable, PTT falls back to focused-window input. The original keyboard registration is restored on teardown. Native Windows background-input, fullscreen, and session-transition behavior has not been verified. PTT's low-level hook may miss input in elevated applications under Windows' integrity restrictions; Raw Input delivery with an elevated foreground application is unverified. |
+
+When background input is unavailable, only PTT can fall back to focused-window
+events; settings say it is focused-only. Focus loss, window detachment and
+backend changes release focused holds. Global and focused holds are aggregated,
+so releasing one source cannot cancel the other. Command chords never use a
+focused-only fallback.
+
+Removing an input device releases the holds it may own. On X11 that is the keys
+the device reported down, plus startup-held keys the keyboard no longer reports
+down; detached or disabled devices count too. On Windows any device removal,
+even a mouse, releases a global PTT hold; the PTT key must be released before it
+talks again.
+
+The watcher belongs to the application, not a window or selected channel, and
+routes commands to the current call while minimized or closed to the tray.
+Recording suppresses commands until it ends. Rebinding replaces the old
+watcher; stale queued callbacks cannot execute through the replacement, and
+stale hold writes from the old watcher are ignored. Only one instance per OS
+user and desktop session owns command delivery, even when another instance uses
+a different data directory. Portal-owner loss clears its grants and held keys
+before retrying setup. Response 1 (user cancellation) is terminal.
+Non-cancellation CreateSession failures retry with capped backoff and do not
+consume the BindShortcuts budget. A successful BindShortcuts response resets
+a two-request budget: one initial request and at most one retry. Every sent
+BindShortcuts request that does not return code 0, including owner loss while
+waiting, consumes one attempt. After two unsuccessful requests, the worker
+stops; PTT remains focused-only and command shortcuts stay unavailable.
+Changing bindings or restarting Yapfast creates a new watcher. An explicit
+portal Session.Closed remains terminal.
+
+`x11_delivers_chords_and_ptt_without_consuming_the_key` exercises a separate
+client's keyboard grab on a private X server.
+The sequential `test-x11` stage in `scripts/check` runs this regression under
+Xvfb with synthetic `xdotool` events.
+`one_portal_session_binds_all_ids_and_emits_command_edges` exercises PTT,
+command edge deduplication, missing and changing assignment descriptions, and
+the version-1 editor limit on a private bus. The
+`portal_setup_retries_after_owner_restart_*` tests cover recovery while
+CreateSession and BindShortcuts responses are pending.
+`portal_create_session_retries_after_response_ended` covers retrying a
+non-cancellation CreateSession response.
+`portal_bind_response_ended_retries_and_recovers` covers retry after response
+2, successful global assignment recovery, and budget reset after owner restart.
+`portal_bind_stops_after_two_unsuccessful_requests`,
+`portal_bind_decline_is_terminal` and
+`portal_bind_owner_loss_consumes_retry_budget` cover the retry limit, user
+cancellation, and interrupted-request accounting.
+`v2_list_wait_processes_session_signals` covers portal signals, stale responses
+and focused/global PTT hold cleanup before the fallback key-up.
+`portal_list_response_ended_preserves_active_grants` confirms that a nonzero
+`ListShortcuts` response does not revoke working grants.
+`ptt_only_hook_installs_session_transition_monitors` checks that Windows PTT-only
+setup installs notifications without enabling a Raw Input sink.
+
+`global_hotkey_owner_excludes_other_adapters_until_release` verifies lock
+contention and lease release/reacquisition between application adapters.
+All ignored tests require their documented private environments.
+`push_to_talk_sends_only_while_the_key_is_held` against the fake Discord checks
+that beeps with the key up send nothing and with it held do.
+
+`game_stream_hotkey_fails_closed_and_toggles_only_a_recognized_game` checks
+that a game-only command does not fall back without a running game, and that a
+recognized test process streams and stops through the fake call.

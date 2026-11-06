@@ -882,6 +882,17 @@ impl Application {
             effects.push(Effect::Backend(Command::CloseRoom));
         } else {
             effects.push(Effect::Backend(Command::Open(id)));
+            // An unread Discord channel that shows nothing yet opens at its
+            // last read message: the messages around it load beside the
+            // newest, rather than once those showed they don't reach it.
+            // The backend answers from what it kept when that reaches it.
+            if self.state.messages.is_empty()
+                && let Some((marker, false)) = self.read_marker.clone()
+                && discord::item_order(&marker).is_some()
+            {
+                self.read_marker = Some((marker.clone(), true));
+                effects.extend(self.focus(marker));
+            }
         }
         effects
     }

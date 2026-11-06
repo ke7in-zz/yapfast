@@ -29,8 +29,7 @@ use crate::{
         Command, Contact, CustomEmoji, Delivery, Direction, DiscordCommand, Embed, EmbedField,
         Event, History, MAX_PREVIEW_DOWNLOAD_BYTES, MentionGroup, Notification, OutgoingFile,
         Picture, Placement, Poll, PollAnswer, Profile, ProfileFriend, ProfileRole, ProfileServer,
-        Reaction, Reply, Role, SearchHit, ThreadLink, Topic, Video, VideoCommand, decode_preview,
-        decode_view, plain_snippet,
+        Reaction, Reply, Role, SearchHit, ThreadLink, Topic, Video, VideoCommand, plain_snippet,
     },
     discord::{self, KEPT_CHANNELS, KEPT_MESSAGES},
     mention::{Mentioned, Target},
@@ -343,7 +342,12 @@ impl Chat {
         match wake {
             Wake::Snapshot(Some(snapshot)) => {
                 let online = snapshot.status == Status::Online;
-                // Messages sent while disconnected arrive with the latest page.
+                // Live events stop with the connection: kept channels load
+                // their latest page again when opened, and messages sent
+                // while disconnected arrive with the open one's.
+                if !online && self.online {
+                    self.channels.missed();
+                }
                 if online
                     && !self.online
                     && let Some(channel) = &mut self.channels.open

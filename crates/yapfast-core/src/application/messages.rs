@@ -574,7 +574,7 @@ impl Application {
     /// Asks for the messages around an item of the selected room, which show
     /// in place of its timeline. Pages on their way are for what shows now,
     /// which the backend drops.
-    fn focus(&mut self, item: String) -> Vec<Effect> {
+    pub(super) fn focus(&mut self, item: String) -> Vec<Effect> {
         let Some(room) = self
             .state
             .selected_room()

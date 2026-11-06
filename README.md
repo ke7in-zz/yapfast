@@ -100,9 +100,14 @@ GOATed GIF loads.
 
 Voice channels and DM calls, with mute, deafen, a volume for each person,
 noise suppression, echo removal, and a voice gate you can tune, or
-push-to-talk on any key you like, held in any app. Go Live, watch other
+push-to-talk on any key you like, with background input where your desktop
+supports it. Go Live, watch other
 people's streams, turn on your camera and play the soundboard. The call
 stays up while you read other channels.
+
+Set optional global voice shortcuts to toggle a recognized game's stream or
+leave your call without opening Yapfast. [Voice shortcuts](docs/discord/voice.md#global-voice-shortcuts)
+explains background support, permissions and the Wayland game-capture limit.
 
 The noise suppression could be better, though. Know an open source one that
 does a better job? PLEASE tell me.
@@ -151,7 +156,8 @@ the pages your roles let you use, and channel settings with their permissions.
 Make and edit channels and categories, invite people, hand out roles, change
 nicknames, time out, kick and ban. In voice, server mute, deafen and move
 people to another channel. Edit your server profile, and leave. Join a server
-by invite, from the + under your servers or a link in chat. Folders show up as
+by invite, from the + under your servers or a link in chat, and open a
+scheduled event from its link to mark yourself interested. Folders show up as
 they do in Discord.
 
 <p align="center">
@@ -165,6 +171,8 @@ they do in Discord.
   message requests.
 - **Messages** you can send, reply to, edit, react to, pin, forward and attach
   files to, with Markdown, embeds, custom emoji, stickers and spoilers.
+  Discord's own links to servers, channels, messages and profiles open in
+  Yapfast, including one handed to it by the desktop.
 - **Threads**: start one from a message, browse a channel's threads, join or
   leave one, and read it beside its channel.
 - **Search** a whole server with Discord's filters, and browse a channel's pins.

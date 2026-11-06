@@ -220,7 +220,8 @@ threads](servers.md#a-channels-list-of-threads).
 
 ## Profiles
 
-Clicking someone in a channel's member list, or under a voice channel,
+Clicking someone in a channel's member list or under a voice channel, or
+following a Discord `/users/{id}` link,
 shows their profile in a small card beside it, whose picture or name
 enlarges it into a centred one. The card leaves the dates and the roles'
 heading to the full profile, and ends in a box, "Message @name", as
@@ -243,7 +244,8 @@ profile lists their roles in role order, when they joined Discord and the server
 and the servers and friends the account shares with them. Profiles are kept for
 five minutes, at most 32 of them. Presence and activity come from the member
 list, since the profile doesn't carry them. When Discord refuses, the card
-keeps what the member list knew and says so.
+keeps what the member list knew and says so. A linked profile with nobody in
+a list to show first opens with the id as its name while that fetch runs.
 
 The profile shows each of the person's activities as a card, as Discord's does:
 what they're playing, streaming, listening to, watching or competing in, or
@@ -445,9 +447,16 @@ Settings → Game activity → Share the game you play is the account's own
 `show_current_game` setting, which Discord's apps change too. Yapfast reads
 it from READY and settings updates and writes it with
 `PATCH /users/@me/settings-proto/1`; it's on unless the account turned it
-off, and a newly linked account shares nothing until READY says. While it's
-off, nothing scans processes, downloads the game list or serves the RPC
-socket.
+off. While off, the periodic detector doesn't scan processes or download
+the game list or serve the RPC socket. An explicit game-stream-toggle press
+is the one exception: it makes a single fresh local scan even while this
+setting is off.
+That scan uses only the already cached Discord game list, this device's custom
+games and installed Steam manifests; it never downloads or refreshes the list
+and does not start the periodic detector or RPC socket. The result stays
+local: process IDs and executable identities are not sent to Discord, added
+to presence or voice snapshots, or logged. `YAPFAST_DISCORD_GAME_DETECTION=0`
+and the test-server fixture-isolation rule still disable the scan.
 
 Every 15 seconds (half a second against the test server, for tests) a
 blocking task lists this user's processes with

@@ -57,22 +57,28 @@
     in {
       # scripts/package-linux.py copies the notices of Skia's third-party
       # code from here; the prebuilt Linux archive carries only Skia's own.
-      packages.${system}.skia-source = pkgs.symlinkJoin {
-        name = "yapfast-skia-0.153.3-linux-source";
-        paths = [ windowsSkiaSource ] ++ map (dep: pkgs.runCommand "yapfast-skia-${dep.name}" {} ''
-          mkdir -p "$out/third_party/externals/${dep.name}"
-          cp -r ${dep.source}/. "$out/third_party/externals/${dep.name}/"
-        '') linuxSkiaDependencies;
+      packages.${system} = {
+        skia-source = pkgs.symlinkJoin {
+          name = "yapfast-skia-0.153.3-linux-source";
+          paths = [ windowsSkiaSource ] ++ map (dep: pkgs.runCommand "yapfast-skia-${dep.name}" {} ''
+            mkdir -p "$out/third_party/externals/${dep.name}"
+            cp -r ${dep.source}/. "$out/third_party/externals/${dep.name}/"
+          '') linuxSkiaDependencies;
+        };
+        # The private session bus used by scripts/check's portal protocol test.
+        portal-test-bus = pkgs.dbus;
+        # Private null-only audio for the recognized-game voice integration.
+        game-stream-test-audio = pkgs.pulseaudio;
       };
       devShells.${system} = {
         default = pkgs.mkShell {
           nativeBuildInputs = with pkgs; [
-            rustup pkg-config cmake ninja llvmPackages_21.clang
+            rustup pkg-config cmake ninja llvmPackages_21.clang llvmPackages_21.libclang
             protobuf curl jq docker-compose python3 llvmPackages_21.llvm
             # pasta, nftables and iproute2 isolate one voice test participant's network.
             passt nftables iproute2
-            # Runs testing/fake_discord.ts, and its tests side by side.
-            bun cargo-nextest
+            # Runs the fake Discord, parallel tests and media fixtures.
+            bun cargo-nextest ffmpeg
             # Assembles x264's x86-64 code (vendor/x264-src).
             nasm
           ];
@@ -80,6 +86,7 @@
           LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath runtimeLibraries;
           CC = "clang";
           CXX = "clang++";
+          LIBCLANG_PATH = "${pkgs.llvmPackages_21.libclang.lib}/lib";
           PROTOC = "${pkgs.protobuf}/bin/protoc";
           # webrtc-sys must not download binaries from inside a Nix build sandbox.
           LK_CUSTOM_WEBRTC = "${webrtc}";

@@ -1,0 +1,39 @@
+name: Check
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  native-linux:
+    name: Native Linux
+    if: github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # This disposable runner needs the same space as the existing Nightly build.
+      - name: Free unused runner SDK space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
+        with:
+          enable_kvm: false
+          set_as_trusted_user: false
+          extra_nix_config: |
+            max-jobs = 2
+            cores = 2
+      - name: Check default, Matrix and headless builds
+        run: nix develop path:./nix --command env CC=clang CXX=clang++ scripts/check --fast --matrix
+      - name: Check fake Discord services
+        run: nix develop path:./nix --command env CC=clang CXX=clang++ scripts/test-fake-discord

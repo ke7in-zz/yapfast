@@ -6,9 +6,10 @@ Three Nix shells cover the work:
 
 - `nix develop path:./nix` is the development shell. Run every `cargo` command
   in it, as `nix develop path:./nix --command cargo ...`. It also provides
-  `bun` for the fake Discord.
+  `bun` for the fake Discord and FFmpeg (`ffmpeg` and `ffprobe`) for its media
+  fixtures.
 - `nix-shell --impure testing/display/shell.nix` adds Weston,
-  PulseAudio, the ALSA plugins and FFmpeg to it, for the private display that
+  PulseAudio and the ALSA plugins to it, for the private display that
   `scripts/ui-session` starts.
 - `nix develop path:./nix#windows` cross-builds for Windows; see the
   [Windows beta guide](windows-beta.md).
@@ -102,6 +103,16 @@ row is no longer shown or goes. A wheel scroll animates
 `content-y` and would carry on to where it was going, so the list stops that
 animation when rows go in above inside `hold`. This is `yapfast_anchor.rs` and the
 changes marked `Yapfast:` in `model/repeater.rs`.
+
+When `content-y` moves to the end of a `ListView` or past it, as when the
+timeline follows its newest message or a scroll reaches the end, the list lays
+its rows out up from the last, which ends at the bottom of the view, measuring
+each as drawn. Upstream lays them out down from the row the average row height
+puts there, which lands short of the end or past it, so `content-height`
+changes again and whatever follows the end moves `content-y` again, one round
+of change handlers each time. Slint allows ten such rounds in a row before it
+warns of a long callback chain. This is `yapfast_layout_end` in
+`model/repeater.rs`.
 
 A `TextInput` draws parts of its text as a `StyledText` draws a mention, in
 a colour on a pill of it, so the composer shows whom its message will
@@ -246,9 +257,10 @@ files named here are in `crates/yapfast-core/native/`.
 - LiveKit's libwebrtc archive, `$LK_CUSTOM_WEBRTC` in the development shell,
   holds libvpx, dav1d, libyuv and Chromium's FFmpeg, which has H264 and
   common audio codecs but no HEVC decoder. `decode.c` decodes watched VP8
-  and H264 streams with it. `video.c` plays video files: libavformat
-  demuxes, libavcodec decodes H264 and the sound, libvpx VP8 and VP9, dav1d
-  AV1, and libyuv converts to RGBA. It also decodes the soundboard's MP3
+  and H264 streams with it, and `av1.c` watched AV1 with its dav1d.
+  `video.c` plays video files: libavformat demuxes, libavcodec decodes
+  H264 and the sound, libvpx VP8 and VP9, dav1d AV1, and libyuv converts to
+  RGBA. It also decodes the soundboard's MP3
   and Ogg sounds, which have no pictures. `vp8.c` and `clip.c` encode VP8 and VP9
   with libvpx, `picture.c` scales with libyuv, and `camera.cc` captures
   through libwebrtc's capture module.
@@ -276,20 +288,30 @@ or Intel's driver.
 `scripts/check` enters the development shell itself. `scripts/check --fast`
 builds with the `fast` profile, as local work does. It runs, in order:
 formatting; `scripts/check-doc-links`, which fails on a Markdown link to a
-missing file or heading; Clippy with warnings denied and the tests for the whole workspace
-(Clippy leaves out the UI crate's own targets, which hold no code to lint, but
-still checks it as a dependency); a build; and the desktop smoke test, which
-runs `target/<profile>/yapfast`, the desktop build, from that build. After
-those, one at a time, as each compile of the UI crate takes several GiB of
-memory, it runs Clippy for the Discord-only and Matrix-only builds, then the
-headless build's Clippy and smoke test in `target/check-combinations/`, so the
-headless binary doesn't replace the desktop one. The Discord-only and
-Matrix-only steps also select `crates/feature-union`, a crate without code
-that turns on the features the full build turns on in the crates below Slint.
-Slint and the UI crate then resolve as in the first Clippy step, and those
-steps reuse its check of the UI crate, taking seconds instead of several
-minutes each. When they compile `yapfast-ui` again, a dependency has drifted
-and `feature-union` needs its features. Each step prints `=== step` and `rc=N` when it ends,
+missing file or heading; Clippy with warnings denied and the tests for the
+whole workspace (the UI crate is outside the workspace, so Clippy checks it
+only as a dependency, with plain rustc, and doesn't lint its generated code);
+the private D-Bus portal tests; the XInput2 raw-input regression under Xvfb
+with synthetic `xdotool` key events; a build; and the desktop smoke test, which
+runs `target/<profile>/yapfast`, the desktop build, from that build. These build
+the default features, the release's: Discord on the desktop (see
+[Networks](#networks)).
+
+`scripts/check --matrix` adds the builds with Matrix, after those and one at
+a time, as each compile of the UI crate takes several GiB of memory: Clippy
+and the tests with Matrix beside Discord, Clippy for the Matrix-only build,
+then the headless build's Clippy and smoke test in
+`target/check-combinations/`, so the headless binary doesn't replace the
+desktop one. Run it before a release and after a change to code that Matrix
+shares, such as `#[cfg(feature = "matrix")]` branches in `yapfast-core` and
+the app. The Matrix-only step also selects `crates/feature-union`, a crate
+without code that turns on the features the full build turns on in the
+crates below Slint. Slint and the UI crate then resolve as in the Clippy step
+with Matrix, and the Matrix-only step reuses its check of the UI crate,
+taking seconds instead of several minutes. When it compiles `yapfast-ui`
+again, a dependency has drifted and `feature-union` needs its features. The
+default steps leave `feature-union` out, so they resolve as a plain
+`cargo build`. Each step prints `=== step` and `rc=N` when it ends,
 with Rust's errors when it fails, and keeps its full log under `target/check/`.
 The script runs every step and exits non-zero if any failed.
 
@@ -361,18 +383,21 @@ before.
 
 ## Networks
 
-Matrix and Discord are Cargo features, `matrix` and `discord`, and the default
-build has both. A build can leave either one out:
+Matrix and Discord are Cargo features, `matrix` and `discord`. The default
+build is the release's, Discord on the desktop; a build can add Matrix, or
+carry Matrix alone:
 
 ```sh
-cargo build --release --no-default-features --features desktop,discord  # Discord only
-cargo build --release --no-default-features --features desktop,matrix   # Matrix only
+cargo build --release                                                  # Discord only
+cargo build --release --features matrix                                # Discord and Matrix
+cargo build --release --no-default-features --features desktop,matrix  # Matrix only
 ```
 
 Releases are the Discord-only build: `nix/package.nix` (`buildFeatures`) and
-`scripts/package-linux.py` (`FEATURES`) build with `--no-default-features
---features desktop,discord`, while a plain `cargo build` carries Matrix too.
-Measure with the release's features.
+`scripts/package-linux.py` (`FEATURES`) name its features, `desktop,discord`,
+rather than rely on the defaults. The Matrix tools, such as `--voice-demo`,
+`--call-experiment`, the session commands and `scripts/test-voice`, need
+`--features matrix`. Measure with the release's features.
 
 A Discord-only build signs in by linking Discord by QR code, and connects with
 the account linked on the device from then on. Voice calls
@@ -447,6 +472,9 @@ the repository to `/home`, `/cargo` and `/yapfast` with `--remap-path-prefix`
 and Clang's `-ffile-prefix-map`. On Windows it takes `cargo xwin env`'s
 environment and adds the C flags to it, since `cargo xwin build` sets the
 `CFLAGS_<target>` the `cc` crate reads first; `scripts/build-windows` uses it.
+It also gives bindgen the real target: thorvg-sys's build script passes
+`--target=x86_64-none-elf` on every cross build, which can't read the MSVC
+headers.
 `scripts/package-windows.py` refuses an executable holding the home folder's
 path in UTF-8 or UTF-16. A Linux build from the dev shell needs the same, and
 its linker also writes a RUNPATH of `$PWD/outputs/out/lib` and Nix store

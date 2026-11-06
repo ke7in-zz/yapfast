@@ -235,6 +235,7 @@ impl Shell {
                     }
                 }
             });
+            self.adapter.borrow_mut().open_pending_link(&window);
             return Some(window);
         }
         match self.make() {
@@ -244,6 +245,19 @@ impl Shell {
                 None
             }
         }
+    }
+
+    /// Keeps a Discord link a later start handed this one until Discord
+    /// is online and a window can open it.
+    fn queue_link(self: &Rc<Self>, link: String) {
+        #[cfg(feature = "discord")]
+        if yapfast_core::discord::discord_route(&link).is_some() {
+            self.adapter.borrow_mut().pending_link = Some(link);
+            return;
+        }
+        #[cfg(not(feature = "discord"))]
+        let _ = link;
+        tracing::warn!("a later start handed Yapfast a link it can't open");
     }
 
     /// Opens the window on a conversation, as a clicked notification does.
@@ -278,6 +292,7 @@ impl Shell {
         watch_window(&window, &self.adapter);
         self.watch(&window);
         self.adapter.borrow_mut().refresh(&window);
+        self.adapter.borrow_mut().open_pending_link(&window);
         let adapter = self.adapter.borrow();
         let state = &adapter.app.state;
         if let Some(top) = view.and_then(|view| view.top)
@@ -311,6 +326,33 @@ impl Shell {
     }
 }
 
+/// Native command delivery does not retain or create a YapfastWindow.
+pub(super) fn hotkey(command: crate::push_to_talk::Command, generation: u64) {
+    let Some(shell) = SHELL.with(|shell| shell.borrow().upgrade()) else {
+        return;
+    };
+    if !shell.adapter.borrow().hotkey_current(generation) {
+        return;
+    }
+    let command = match command {
+        crate::push_to_talk::Command::ToggleStream => voice::Command::ToggleGameStream,
+        crate::push_to_talk::Command::LeaveVoice => voice::Command::Leave,
+    };
+    shell.act(Action::Voice(command));
+}
+
+pub(super) fn hotkey_status(generation: u64) {
+    let Some(shell) = SHELL.with(|shell| shell.borrow().upgrade()) else {
+        return;
+    };
+    let adapter = shell.adapter.borrow();
+    if adapter.hotkey_generation() == generation
+        && let Some(window) = shell.window()
+    {
+        adapter.show_hotkeys(&window);
+    }
+}
+
 /// Makes the window again where it was, on Appearance as the setting that
 /// asked for it, for a change Slint can't make to the shown window.
 pub(super) fn remake_window() {
@@ -327,11 +369,15 @@ pub(super) fn remake_window() {
 /// Yapfast started again on this folder, and the new start asked for the
 /// window: shows it, taking the focus with the token the desktop gave that
 /// start.
-pub(super) fn launched(token: Option<String>) {
+pub(super) fn launched(launch: crate::instance::Launch) {
+    let crate::instance::Launch { token, link } = launch;
     let Some(shell) = SHELL.with(|shell| shell.borrow().upgrade()) else {
         return;
     };
     tracing::info!("Yapfast started again; showing the window");
+    if let Some(link) = link {
+        shell.queue_link(link);
+    }
     let Some(window) = shell.window() else {
         crate::instance::give_next_window(token);
         shell.open();
@@ -385,6 +431,7 @@ impl Adapter {
     /// The window closed: what only it used stops with it. The models stay, so
     /// the next window shows them without building them again.
     pub(super) fn detach(&mut self) {
+        crate::push_to_talk::clear_focused_hold();
         self.meter = None;
         #[cfg(feature = "discord")]
         {
@@ -396,6 +443,7 @@ impl Adapter {
             dialog.abort();
         }
         self.window = slint::Weak::default();
+        self.recording_hotkey(false);
     }
 
     /// Rings for a DM call that rings this account, except in Do Not Disturb,

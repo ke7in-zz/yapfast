@@ -30,8 +30,12 @@ authors' member profiles.
 Yapfast keeps the open channel's messages in memory, and those of the 40
 channels open before it, so going back to one shows it at once. A closed
 channel keeps its newest 200 messages as metadata and follows new messages,
-edits, deletions and reactions while it's kept. Opening it again loads the
-latest page in the background and fits it in: messages kept within the page's
+edits, deletions and reactions while it's kept. Opening it again shows those
+without asking Discord, as long as it kept up: its latest page came, and no
+live event went by without it since, as when the connection drops for a new
+session (a resume replays what was missed) or Yapfast falls behind on
+events. Otherwise it loads the latest page in the background and fits it
+in: messages kept within the page's
 span that it lacks were deleted meanwhile, and when a full page starts after
 everything kept, more came than a page holds, so only the page stays. The UI
 keeps the same 40 channels' last timeline and member list, so going back shows
@@ -85,6 +89,13 @@ divider finds its place even when the last read message was deleted. When
 every loaded message is unread, the 50 around the last read one load in
 place of the newest, as a window of older messages that opens at the
 divider; when even those are all newer, the divider goes above the oldest.
+An unread channel that shows nothing yet, neither kept in memory nor on
+disk, asks for the 50 around the last read one together with the newest 50,
+so it opens at the divider after one round trip rather than two. When the
+messages kept on disk reach back to the last read one, they're what shows
+around it, and only the newest page is asked for. A page around it with
+fewer than half a page from it on reaches the newest message, as Discord's
+client takes it, so it shows as the newest rather than as a window.
 The open text channel lists its members on the right as Discord's sidebar
 does: under hoisted roles, then online, then offline, with offline members
 faded. Each shows a status dot for online, idle or do not disturb, their name
@@ -134,6 +145,11 @@ Yapfast starts from Discord as it last saw it, kept in the data directory by
   stale; the proxy's signature (`ex`, `is` and `hm`) isn't part of the key,
   so a picture signed again is found. Past 256 MiB the least recently shown
   go. Attachments' own files aren't kept.
+- `discord-build-number` holds the web client's build number as its page
+  last gave it, which Yapfast sends with every request and the gateway's
+  identify, as the web client does. A start with it kept connects at once
+  and reads the page meanwhile, keeping what it finds for the next start;
+  without it, the page is read before connecting.
 
 The files are readable only by the user and aren't encrypted. Each names its
 login by a SHA-256 hash of the token, so another linked account starts empty,
@@ -190,7 +206,10 @@ an error.
   Super reactions aren't listed apart yet.
 - Messages support text, replies, edits, deletions, reactions, mentions and
   attachments. Up to ten files go with a message, uploaded to Discord's
-  storage first and then named in the message. Each file is limited as
+  storage first and then named in the message. As in Discord's client,
+  each file asks `POST /channels/{id}/attachments` for its upload URL and
+  then `PUT`s itself there, all files at once; if one fails, the others
+  are deleted. Each file is limited as
   Discord limits it: 20 MB without Nitro, 50 MB with
   Nitro Basic or the old Nitro Classic, and 500 MB with Nitro, by the
   account's `premium_type`. A server boosted to level 2 allows 50 MB and one
@@ -213,6 +232,41 @@ an error.
   message says. Pictures come through Discord's
   media proxy (`images-ext-*.discordapp.net`), so Yapfast never contacts the
   linked site, and embeds of a message marked to hide them don't show.
+- Discord's own links to a server, channel, message or person open that
+  place in Yapfast, DM links included; an invite opens Join a Server first,
+  an event link shows the scheduled event with its Interested button
+  ([Event links](servers.md#event-links)), and a gift link
+  (`discord.gift/…`, `/gifts/…`) shows the gift and redeems it on the click,
+  never from opening the link (`link.rs`, `gift.rs`). A gift code drops the
+  dashes that may group it, as Discord's client reads it. A gift that needs
+  a payment source, or is from a promotion, offers its link in the browser
+  instead, since only Discord redeems those. A dialog closed while its gift
+  is redeeming and opened again shows it still redeeming, and Discord's
+  answer. The same reader takes web, `discord://` and `yapfast://` links
+  handed to a start. Only Discord's own hosts and snowflake ids match, so a
+  look-alike stays an ordinary web link. Discord pages Yapfast has no screen for, such
+  as the shop and server templates, still open in the browser, as does a
+  link Yapfast can't show: to a server the account isn't in, or any while
+  Discord is offline (`AppState::opens_discord_route`).
+- An authorization link (`/oauth2/authorize`) shows what the application
+  asks for, in the words of Discord's page, and authorizes it only on the
+  click, in the server picked (`link.rs`, `oauth.rs`). A red line warns of
+  the `rpc` scope, which controls the Discord client, and of a bot asking
+  for Administrator; a bot's permissions no role switch names count as
+  "N more". A link that locks its server shows that server and can't be
+  moved to another: if the account can't add apps there, the dialog says so
+  and offers no Authorize. Like Discord's client, Yapfast sends only the
+  fields it read (`client_id`, `scope`, `response_type`, `redirect_uri`,
+  `state`, `nonce`, the PKCE pair, `integration_type`), rebuilt into each
+  query, with the server and permissions in the body; a link naming one of
+  them twice opens in the browser, as do links without scopes (install
+  links, whose scopes Discord's page reads from the application), links
+  asking for `webhook.incoming` (which needs a channel picked) and links
+  with a scope Yapfast can't describe. Afterwards Yapfast goes where
+  Discord's answer (`location`) says: a page of Discord's own ends the
+  dialog at "Authorized", a web page opens in the browser, and any other
+  address, such as an app's `myapp://`, is shown to copy and never opened,
+  as no link in a message starts another program (`links::openable`).
 - Animated GIFs, APNGs and animated WebPs play, in messages, as stickers and in
   the image viewer. The media proxy keeps GIFs as GIFs; other pictures come as
   WebP, asked for with `animated=true` as Discord's client does, so an animated
@@ -284,8 +338,11 @@ an error.
   turns `:name:` into Discord's `<:name:id>` only for those. Animated emoji
   show their first frame.
 - Stickers show as pictures at 160px, PNG and APNG stickers from the CDN and
-  GIF ones from the media proxy. Lottie stickers, which are vector
-  animations, show their name.
+  GIF ones from the media proxy. Lottie stickers render locally from the
+  CDN's JSON with ThorVG, one frame at a time, and follow the same animation
+  playback setting as GIF stickers. Only a Lottie sticker's address
+  (`ready::lottie_sticker`) decodes as Lottie; other pictures never reach
+  ThorVG's parser, whatever their bytes.
 - Messages from people this account blocked show collapsed as "Blocked
   message", which "Show it" opens, and they don't notify or show typing.
   Yapfast learns the blocked from READY's relationships (type 2) and keeps them
@@ -357,7 +414,10 @@ finds GIFs through Klipy, and Yapfast asks Discord as its desktop client does:
   plays. Shift and a click puts the URL in the message instead.
 - Only the GIFs in sight, and a screen either side, load and play; they come
   from Klipy's or Tenor's media hosts, at the size they show, and go when the
-  picker closes.
+  picker closes. Dragging the picker wider moves and stretches the tiles
+  already shown; a quarter second after the width stops changing, a picture
+  whose tile grew by more than a tenth, and that filled its old tile, is
+  fetched again at the new size, the old one showing until it comes.
 - Favourites are kept as Discord's are, in the second settings protobuf
   (`FrecencyUserSettings`, field 2): a map from each GIF's page to its
   picture, size, format and order. `GET /users/@me/settings-proto/2` reads
@@ -405,10 +465,13 @@ so a deleted message's place shows, and Yapfast says it couldn't find the
 message. A jump into another channel opens that channel at the message.
 
 Scrolling down the window loads the 50 `after` its newest message, and up,
-the 50 `before` its oldest, a page at a time. Discord doesn't say how it
-splits a page around a snowflake, so Yapfast learns where the channel starts
-from a page before, and that the window reached the newest message from a
-short page after, or once it reaches the newest messages Yapfast kept.
+the 50 `before` its oldest, a page at a time. Discord sends at most half a
+page from before the snowflake, and as its client does, Yapfast takes fewer
+than that, less one (under 24), as the channel's start, so a window around
+the first unread message of a new channel asks for nothing before it.
+Otherwise it learns where the channel starts from a page before. It learns
+that the window reached the newest message from a short page after, or once
+it reaches the newest messages Yapfast kept.
 
 While the window shows, the channel's newest messages wait beside it, at
 most 200 as a closed channel keeps, and follow new messages, edits,

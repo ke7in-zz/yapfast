@@ -25,9 +25,10 @@ flowchart LR
 ## Where things live
 
 `crates/yapfast-ui` holds only the Slint build: `build.rs` compiles
-`ui/yapfast.slint` and `src/lib.rs` includes the generated code. The Slint
-files themselves are `ui/*.slint`, and the Rust that fills them is
-`src/ui.rs` and `src/ui/`. The menus a right click opens are in
+`ui/yapfast.slint` and `src/lib.rs` includes the generated code. It is a
+path dependency outside the Cargo workspace, so Clippy doesn't lint that
+code. The Slint files themselves are `ui/*.slint`, and the Rust that fills
+them is `src/ui.rs` and `src/ui/`. The menus a right click opens are in
 `src/ui/menus.rs`.
 
 The Discord connection is `crates/yapfast-discord/src/service.rs`, with its
@@ -103,7 +104,8 @@ keeps them beside the window, following live events, and Matrix rebuilds
 its live timeline from the SDK's event cache. Neither loads them again. The UI reports visible item ids, with six rows of margin on
 each side, through `Action::VisibleMessages` and `Command::VisibleMessages`.
 Discord and Matrix download and decode previews for those items and release
-distant decoded handles. Reports are coalesced over 50 ms, reject old rooms,
+distant decoded handles. A report goes out at once after a quiet spell and at most every 50 ms
+while the view moves; reports reject old rooms,
 and refresh when temporary message ids become server event ids even if the
 row count stays the same. Discord's recent channels share an 8 MiB LRU cache
 of decoded preview pixels; closing a channel clears its own preview handles

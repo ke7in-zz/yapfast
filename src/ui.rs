@@ -45,6 +45,7 @@ mod callbacks;
 mod channel_settings;
 mod games;
 mod gifs;
+mod hotkeys;
 mod menus;
 mod messages;
 #[cfg(windows)]
@@ -91,13 +92,86 @@ pub fn run(
     renderer: Option<graphics::Renderer>,
     gpu_failure: Option<String>,
     background: bool,
+    open_link: Option<String>,
+) -> Result<Exit> {
+    let result = run_inner(
+        runtime,
+        root,
+        preview,
+        renderer,
+        gpu_failure,
+        background,
+        open_link,
+    );
+    #[cfg(windows)]
+    let result =
+        preserve_result_after_windows_teardown(result, crate::push_to_talk::windows_teardown);
+    result
+}
+
+#[cfg(windows)]
+fn preserve_result_after_windows_teardown(
+    result: Result<Exit>,
+    teardown: impl FnOnce() -> bool,
+) -> Result<Exit> {
+    if !teardown() {
+        tracing::error!("Windows could not release Yapfast's background keyboard registration.");
+    }
+    result
+}
+
+#[cfg(all(test, windows))]
+mod windows_teardown_tests {
+    use super::*;
+
+    #[test]
+    fn renderer_exit_survives_windows_teardown_failure() {
+        assert!(matches!(
+            preserve_result_after_windows_teardown(Ok(Exit::Restart), || false).unwrap(),
+            Exit::Restart
+        ));
+        assert!(matches!(
+            preserve_result_after_windows_teardown(
+                Ok(Exit::UseSoftware("GPU failure".into())),
+                || false
+            )
+            .unwrap(),
+            Exit::UseSoftware(reason) if reason == "GPU failure"
+        ));
+    }
+
+    #[test]
+    fn original_run_error_survives_windows_teardown_failure() {
+        let original = std::io::Error::other("original run error");
+        let result = preserve_result_after_windows_teardown(Err(original.into()), || false);
+        let Err(error) = result else {
+            panic!("teardown replaced the original run error");
+        };
+        assert!(error.downcast_ref::<std::io::Error>().is_some());
+        assert_eq!(error.to_string(), "original run error");
+    }
+}
+
+fn run_inner(
+    runtime: BackgroundRuntime,
+    root: PathBuf,
+    preview: bool,
+    renderer: Option<graphics::Renderer>,
+    gpu_failure: Option<String>,
+    background: bool,
+    open_link: Option<String>,
 ) -> Result<Exit> {
     let (plan, placement, system_title_bar, mut instance) = {
         let mut layout = Layout::read(&root);
         let instance = if preview {
             crate::instance::Instance::default()
         } else {
-            match crate::instance::claim(&root, !layout.multiple_windows, background) {
+            match crate::instance::claim(
+                &root,
+                !layout.multiple_windows,
+                background,
+                open_link.clone(),
+            ) {
                 crate::instance::Start::Run(instance) => instance,
                 crate::instance::Start::Handed => return Ok(Exit::Closed),
             }
@@ -116,6 +190,16 @@ pub fn run(
     // failed GPU surface; Yapfast owns the fallback and tells the user about it.
     // Windows draws the GPU setting with Direct3D 12; see [`graphics`].
     let selector = slint::BackendSelector::new().backend_name("winit".into());
+    #[cfg(windows)]
+    let selector = {
+        use slint::winit_030::winit::event_loop::EventLoop;
+        let events = EventLoop::<slint::winit_030::SlintEvent>::with_user_event();
+        selector
+            .with_winit_event_loop_builder(events)
+            .with_winit_custom_application_handler(
+                crate::push_to_talk::windows_custom_application_handler(),
+            )
+    };
     let (selector, renderer) = match plan.renderer {
         graphics::Renderer::Gpu if cfg!(windows) => (
             selector.renderer_name("skia".into()).require_d3d(),
@@ -146,7 +230,8 @@ pub fn run(
     };
     // Started at sign-in, Yapfast goes to the tray with the saved session.
     // Without one there's nothing to do there but sign in, which needs the window.
-    let hidden = background && !preview && yapfast_core::chat::can_restore(&root);
+    let hidden =
+        background && open_link.is_none() && !preview && yapfast_core::chat::can_restore(&root);
     // Before the window maps, as the desktop looks up its icon then.
     #[cfg(target_os = "linux")]
     if !preview {
@@ -165,6 +250,10 @@ pub fn run(
     }
     if !preview {
         AUTOSTART.set(autostart::SUPPORTED);
+        PROTOCOL.set(cfg!(feature = "discord") && crate::protocol::SUPPORTED);
+        if PROTOCOL.get() {
+            crate::protocol::refresh(&root);
+        }
         autostart::refresh();
     }
     prepare(&window);
@@ -172,7 +261,12 @@ pub fn run(
     bind_callbacks(&window, &adapter);
     watch_window(&window, &adapter);
     adapter.borrow_mut().watch_away();
-    adapter.borrow_mut().watch_talk_key(&window);
+    adapter.borrow_mut().watch_hotkeys();
+    adapter.borrow().show_hotkeys(&window);
+    adapter.borrow().show_protocol(&window);
+    if !preview {
+        adapter.borrow_mut().pending_link = open_link;
+    }
     adapter.borrow_mut().refresh(&window);
     if preview {
         adapter.borrow_mut().action(&window, Action::Preview);
@@ -206,8 +300,8 @@ pub fn run(
     if hidden {
         shell.start_in_tray();
     }
-    instance.listen(|token| {
-        let _ = slint::invoke_from_event_loop(move || shell::launched(token));
+    instance.listen(|launch| {
+        let _ = slint::invoke_from_event_loop(move || shell::launched(launch));
     });
     tracing::info!(renderer, hidden, "starting the Slint desktop window");
     let _control = test_control().map(|path| control(path, shell.clone()));
@@ -220,6 +314,7 @@ pub fn run(
     placement::flush(&adapter);
     // The icon goes before Yapfast does, not when Windows next looks at it.
     adapter.tray = None;
+    adapter.stop_hotkeys();
     adapter.stop_backend();
     // A window made late, as from the tray after starting in it, failed on the GPU.
     if result.is_ok()
@@ -321,6 +416,7 @@ fn watch_window(window: &YapfastWindow, adapter: &Rc<RefCell<Adapter>>) {
         zoom::apply(window.window(), base.get(), level.get());
         let note = Rc::new(slint::Timer::default());
         let mut keys = zoom::Keys::default();
+        let mut hotkey_recorder = hotkeys::Recorder::default();
         // The winit window exists by the first event it sends.
         #[cfg(target_os = "linux")]
         let mut watching = false;
@@ -462,6 +558,11 @@ fn watch_window(window: &YapfastWindow, adapter: &Rc<RefCell<Adapter>>) {
                     });
                 }
                 crate::push_to_talk::window_event(event);
+                if let Some(window) = weak.upgrade()
+                    && hotkey_recorder.event(event, &window, &adapter)
+                {
+                    return EventResult::PreventDefault;
+                }
                 // While recording the push-to-talk key, the next key becomes
                 // it, and Escape stops; either way only the recorder sees it.
                 if let WindowEvent::KeyboardInput { event: key, .. } = event
@@ -471,6 +572,12 @@ fn watch_window(window: &YapfastWindow, adapter: &Rc<RefCell<Adapter>>) {
                 {
                     if !key.repeat {
                         window.set_talk_recording(false);
+                        let state = adapter.clone();
+                        slint::Timer::single_shot(Duration::ZERO, move || {
+                            if let Some(adapter) = state.upgrade() {
+                                adapter.borrow_mut().recording_hotkey(false);
+                            }
+                        });
                         let recorded = (key.logical_key != Key::Named(NamedKey::Escape))
                             .then(|| crate::push_to_talk::Keybind::recorded(key))
                             .flatten();
@@ -589,6 +696,9 @@ thread_local! {
     static FOCUSED: Cell<bool> = const { Cell::new(false) };
     /// Settings offer starting at sign-in: the platform can, and this isn't the preview.
     static AUTOSTART: Cell<bool> = const { Cell::new(false) };
+    /// Settings offer claiming Discord's protocol links: the platform
+    /// can, this build speaks Discord, and this isn't the preview.
+    static PROTOCOL: Cell<bool> = const { Cell::new(false) };
     /// When animations play, as the settings say.
     static ANIMATE: Cell<Animate> = const { Cell::new(Animate::Focused) };
     /// Opens a conversation from a clicked notification, in the current window.
@@ -903,6 +1013,8 @@ struct Layout {
     sidebar_width: Option<f32>,
     /// The width of a Discord thread shown beside its channel.
     aside_width: Option<f32>,
+    /// The GIF picker's width, as its left edge last dragged it wider.
+    gif_picker_width: Option<f32>,
     /// The member list shows until someone closes it.
     members_hidden: bool,
     /// So does the profile beside a one-to-one DM.
@@ -970,6 +1082,9 @@ struct Layout {
     input_mode: InputMode,
     push_to_talk_key: Option<crate::push_to_talk::Keybind>,
     push_to_talk_release_delay: Option<u32>,
+    /// Global commands are independent of the microphone's input mode.
+    toggle_stream_key: Option<crate::push_to_talk::Chord>,
+    leave_voice_key: Option<crate::push_to_talk::Chord>,
     /// How loud every call sends the microphone and plays, as sliders'
     /// percentages from 0% to 200%; 100% unless changed.
     microphone_volume: Option<u8>,
@@ -1182,6 +1297,9 @@ impl Layout {
         }
         if let Some(width) = self.aside_width {
             window.set_aside_width(width);
+        }
+        if let Some(width) = self.gif_picker_width {
+            window.set_gif_picker_width(width);
         }
         window.set_member_list(!self.members_hidden);
         window.set_profile_panel(!self.profile_panel_hidden);
@@ -1637,9 +1755,8 @@ struct Adapter {
     /// show the voice gate's sensitivity.
     #[cfg(feature = "discord")]
     gate_meter: Option<yapfast_core::discord_audio::GateMeter>,
-    /// Watches the push-to-talk key while push to talk is on and it's set,
-    /// with or without the window.
-    talk_key: Option<crate::push_to_talk::Watcher>,
+    /// Input and command ownership survive destruction of the window.
+    hotkeys: hotkeys::Keys,
     /// Previews of the pictures waiting in the composer, by file; `None` while
     /// one is read, or when it can't be.
     thumbnails: HashMap<PathBuf, Option<pictures::Thumbnail>>,
@@ -1663,6 +1780,8 @@ struct Adapter {
     link_code: Option<(String, slint::Image)>,
     /// What the GIF picker's grid shows.
     gifs: gifs::Shown,
+    /// A Discord link handed to this start before Discord is online.
+    pending_link: Option<String>,
 }
 
 impl Adapter {
@@ -1742,6 +1861,11 @@ impl Adapter {
         let models = Models::default();
         models.attach(window);
         let layout = Layout::read(&root);
+        // Adapter construction applies the process-wide PTT mode.
+        #[cfg(test)]
+        let _ptt_test = crate::push_to_talk::HOLD_TEST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         layout.apply(window);
         let mut app = Application::default();
         app.remember_reaction_uses(layout.reactions.clone());
@@ -1826,7 +1950,7 @@ impl Adapter {
                 watched: None,
                 #[cfg(feature = "discord")]
                 gate_meter: None,
-                talk_key: None,
+                hotkeys: hotkeys::Keys::default(),
                 thumbnails: HashMap::new(),
                 pasted: None,
                 drag_over: false,
@@ -1840,53 +1964,48 @@ impl Adapter {
                 #[cfg(feature = "discord")]
                 link_code: None,
                 gifs: gifs::Shown::default(),
+                pending_link: None,
             })
         }))
     }
 
-    /// Starts, changes or stops watching the push-to-talk key as settings
-    /// say, and shows where it works.
-    fn watch_talk_key(&mut self, window: &YapfastWindow) {
-        let wanted = self
-            .layout
-            .push_to_talk_key
-            .as_ref()
-            .filter(|_| self.layout.input_mode == InputMode::PushToTalk);
-        if self
-            .talk_key
-            .as_ref()
-            .map(crate::push_to_talk::Watcher::key)
-            != wanted
-        {
-            // The old one goes first, ending its portal session.
-            self.talk_key = None;
-            self.talk_key = wanted.cloned().map(|key| {
-                let weak = window.as_weak();
-                crate::push_to_talk::Watcher::start(key, &self.runtime, move |reach| {
-                    let _ = weak.upgrade_in_event_loop(move |window| {
-                        window.set_talk_note(reach.note().into());
-                    });
-                })
-            });
-        }
-        let note = self.talk_key.as_ref().map(|watcher| watcher.reach().note());
-        window.set_talk_note(note.unwrap_or_default().into());
-    }
-
     /// Makes a recorded key the push-to-talk key.
     fn set_talk_key(&mut self, window: &YapfastWindow, key: crate::push_to_talk::Keybind) {
-        tracing::info!(key = key.name, "push-to-talk key recorded");
+        if [
+            self.layout.toggle_stream_key.as_ref(),
+            self.layout.leave_voice_key.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|chord| chord.overlaps_talk(&key))
+        {
+            window.set_talk_note(
+                "That key overlaps a global voice shortcut. Choose another key.".into(),
+            );
+            return;
+        }
         window.set_talk_key(key.name.as_str().into());
         self.layout.push_to_talk_key = Some(key);
         self.layout.write(&self.root);
-        self.watch_talk_key(window);
+        self.watch_hotkeys();
+        self.show_hotkeys(window);
+    }
+
+    /// Shows whether Discord protocol links open here, as the desktop
+    /// has it rather than as a setting remembers it.
+    fn show_protocol(&self, window: &YapfastWindow) {
+        let offered = PROTOCOL.get();
+        window.set_discord_links_available(offered);
+        window.set_discord_links(offered && crate::protocol::discord_enabled(&self.root));
     }
 
     /// Present the existing models and state in a new window.
     fn attach(&mut self, window: &YapfastWindow) {
         self.models.attach(window);
         self.layout.apply(window);
-        self.watch_talk_key(window);
+        self.watch_hotkeys();
+        self.show_hotkeys(window);
+        self.show_protocol(window);
         // The theme being edited goes unsaved with the old window, and rows
         // may carry its mention colour; the refresh after attaching builds
         // them again.
@@ -2089,7 +2208,10 @@ impl Adapter {
                             // Without a window, a call still rings, and the tray shows
                             // what's unread and offers Disconnect in a call.
                             match window {
-                                Some(window) => adapter.show(&window, reach),
+                                Some(window) => {
+                                    adapter.show(&window, reach);
+                                    adapter.open_pending_link(&window);
+                                }
                                 None => adapter.ring(),
                             }
                             adapter.show_tray();
@@ -2204,6 +2326,7 @@ impl Adapter {
                 }
             }
         }
+        self.update_hotkey_owner();
     }
 
     /// Starts linking a Discord account, by QR code or with a pasted token,
@@ -2284,6 +2407,27 @@ impl Adapter {
         );
     }
 
+    /// Opens a Discord link handed to this start once Discord is online
+    /// and no dialog is open. Any app or web page can hand Yapfast a
+    /// link, so one never takes an open dialog's place: an Authorize or
+    /// Join click meant for what the dialog showed would otherwise land
+    /// on what the link opened instead. The opening is scheduled, as its
+    /// callback borrows this adapter.
+    fn open_pending_link(&mut self, window: &YapfastWindow) {
+        if !self.app.state.discord_online || self.app.state.dialog_open() {
+            return;
+        }
+        let Some(link) = self.pending_link.take() else {
+            return;
+        };
+        let window = window.as_weak();
+        slint::Timer::single_shot(Duration::ZERO, move || {
+            if let Some(window) = window.upgrade() {
+                window.invoke_open_link(link.into());
+            }
+        });
+    }
+
     fn action(&mut self, window: &YapfastWindow, action: Action) {
         // A keystroke in the composer changes only the composer, and one in
         // the profile editor only the editor; the rest of the window
@@ -2324,6 +2468,8 @@ impl Adapter {
         } else {
             self.refresh(window);
         }
+        // A handed link may have waited for the dialog this closed.
+        self.open_pending_link(window);
     }
 
     /// Applies a backend event; the caller shows what it can have changed after.
@@ -2347,6 +2493,7 @@ impl Adapter {
 
 impl Drop for Adapter {
     fn drop(&mut self) {
+        self.stop_hotkeys();
         self.stop_backend();
     }
 }
@@ -2591,6 +2738,43 @@ fn device_rows(
         .and_then(|index| i32::try_from(index).ok())
         .unwrap_or(-1);
     (rows, index)
+}
+
+/// Repaints the popup on top and the shadow around it, telling Slint they're
+/// dirty: it repaints the regions it is told of otherwise, which a popup's
+/// contents moving or resizing leaves short of the shadow they draw outside
+/// it. A popup in a window of its own repaints the window whole.
+fn repaint_popup(window: &YapfastWindow) {
+    use i_slint_core::lengths::{LogicalPoint, LogicalRect, LogicalSize};
+    use i_slint_core::window::{PopupWindowLocation, WindowInner};
+    /// How far a popup's shadow reaches past it: its 24px blur and 8px drop.
+    const SHADOW: f32 = 32.;
+    let native = window.window();
+    let inner = WindowInner::from_pub(native);
+    let size = native.size().to_logical(native.scale_factor());
+    let whole = LogicalRect::new(
+        LogicalPoint::new(0., 0.),
+        LogicalSize::new(size.width, size.height),
+    );
+    let dirty = inner
+        .active_popups()
+        .last()
+        .and_then(|popup| match &popup.location {
+            PopupWindowLocation::ChildWindow(place) => {
+                let geometry = i_slint_core::item_tree::ItemTreeRc::borrow_pin(&popup.component)
+                    .as_ref()
+                    .item_geometry(0);
+                Some(LogicalRect::new(*place, geometry.size).inflate(SHADOW, SHADOW))
+            }
+            PopupWindowLocation::TopLevel(_) => None,
+        })
+        .and_then(|popup| popup.intersection(&whole))
+        .unwrap_or(whole);
+    inner
+        .window_adapter()
+        .renderer()
+        .mark_dirty_region(i_slint_core::partial_renderer::DirtyRegion::from(dirty));
+    native.request_redraw();
 }
 
 fn update_model<T: Clone + PartialEq + 'static>(model: &VecModel<T>, rows: Vec<T>) {
