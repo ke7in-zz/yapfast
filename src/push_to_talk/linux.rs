@@ -91,6 +91,8 @@ const TALK_ID: &str = "push-to-talk";
 const STREAM_ID: &str = "toggle-stream";
 const LEAVE_ID: &str = "leave-voice";
 
+const MAX_BIND_SHORTCUTS_ATTEMPTS: u8 = 2;
+
 fn any_binding(bindings: &Bindings) -> bool {
     bindings.talk.is_some() || bindings.toggle_stream.is_some() || bindings.leave_voice.is_some()
 }
@@ -145,7 +147,10 @@ fn portal_trigger(chord: &Chord) -> Option<String> {
 #[derive(Debug)]
 enum PortalFailure {
     Denied,
+    Ended(u32),
+    BindEnded(u32),
     Transient(anyhow::Error),
+    BindTransient(anyhow::Error),
 }
 
 enum PortalExit {
@@ -160,20 +165,55 @@ async fn portal_worker(
     mut requests: mpsc::UnboundedReceiver<()>,
 ) {
     let mut backoff = Duration::from_millis(250);
+    let mut bind_attempts = 0u8;
     statuses.asking(&bindings);
     loop {
-        match portal_session(&bindings, &statuses, &actions, &mut requests).await {
+        match portal_session(
+            &bindings,
+            &statuses,
+            &actions,
+            &mut requests,
+            &mut bind_attempts,
+        )
+        .await
+        {
             Ok(PortalExit::Stopped) => return,
             Ok(PortalExit::Returned) => {
+                backoff = Duration::from_millis(250);
                 report_portal_unavailable(
                     &bindings,
                     &statuses,
-                    "The desktop's global-shortcut service closed this session",
+                    "The desktop's global-shortcut service is restarting",
                 );
             }
             Err(PortalFailure::Denied) => {
                 report_portal_denied(&bindings, &statuses);
                 return;
+            }
+            Err(PortalFailure::Ended(code)) => {
+                tracing::info!(
+                    code,
+                    "the desktop ended global-shortcut setup without granting shortcuts"
+                );
+                report_portal_unavailable(
+                    &bindings,
+                    &statuses,
+                    "The desktop ended global-shortcut setup without granting shortcuts",
+                );
+            }
+            Err(PortalFailure::BindEnded(code)) => {
+                tracing::info!(
+                    code,
+                    "the desktop ended BindShortcuts without granting shortcuts"
+                );
+                report_portal_unavailable(
+                    &bindings,
+                    &statuses,
+                    "The desktop ended global-shortcut setup without granting shortcuts",
+                );
+                if bind_attempts >= MAX_BIND_SHORTCUTS_ATTEMPTS {
+                    return;
+                }
             }
             Err(PortalFailure::Transient(error)) => {
                 tracing::info!(%error, "the global-shortcut service is unavailable");
@@ -182,6 +222,17 @@ async fn portal_worker(
                     &statuses,
                     "The desktop's global-shortcut service is unavailable",
                 );
+            }
+            Err(PortalFailure::BindTransient(error)) => {
+                tracing::info!(%error, "BindShortcuts did not complete");
+                report_portal_unavailable(
+                    &bindings,
+                    &statuses,
+                    "The desktop's global-shortcut service is unavailable",
+                );
+                if bind_attempts >= MAX_BIND_SHORTCUTS_ATTEMPTS {
+                    return;
+                }
             }
         }
         tokio::time::sleep(backoff).await;
@@ -194,6 +245,7 @@ async fn portal_session(
     statuses: &StatusReporter,
     actions: &Actions,
     requests: &mut mpsc::UnboundedReceiver<()>,
+    bind_attempts: &mut u8,
 ) -> Result<PortalExit, PortalFailure> {
     let connection = Connection::session()
         .await
@@ -248,7 +300,15 @@ async fn portal_session(
         )
         .await
         .map_err(|error| PortalFailure::Transient(error.into()))?;
-    let results = response(&mut signals, &mut owners, &request("session")).await?;
+    let results = match response(&mut signals, &mut owners, &request("session")).await {
+        Ok(results) => results,
+        Err(PortalFailure::Ended(_)) => {
+            return Err(PortalFailure::Transient(anyhow!(
+                "CreateSession ended without creating a session"
+            )));
+        }
+        Err(error) => return Err(error),
+    };
     let session = match results.get("session_handle").map(|value| &**value) {
         Some(Value::Str(handle)) => OwnedObjectPath::try_from(handle.as_str())
             .map_err(|error| PortalFailure::Transient(error.into()))?,
@@ -269,25 +329,36 @@ async fn portal_session(
         }
         portal_shortcuts.push((*id, details));
     }
-    let options = HashMap::from([("handle_token", Value::from(format!("{token}_bind")))]);
-    connection
+
+    let bind_options = HashMap::from([("handle_token", Value::from(format!("{token}_bind")))]);
+    *bind_attempts += 1;
+    if let Err(error) = connection
         .call_method(
             Some(PORTAL),
             PATH,
             Some(SHORTCUTS),
             "BindShortcuts",
-            &(&session, portal_shortcuts, "", options),
+            &(&session, portal_shortcuts, "", bind_options),
         )
         .await
-        .map_err(|error| PortalFailure::Transient(error.into()))?;
-    let results = response(&mut signals, &mut owners, &request("bind")).await?;
+    {
+        return Err(PortalFailure::BindTransient(error.into()));
+    }
+    let results = match response(&mut signals, &mut owners, &request("bind")).await {
+        Ok(results) => results,
+        Err(PortalFailure::Denied) => return Err(PortalFailure::Denied),
+        Err(PortalFailure::Ended(code)) => return Err(PortalFailure::BindEnded(code)),
+        Err(PortalFailure::Transient(error)) => return Err(PortalFailure::BindTransient(error)),
+        Err(error) => return Err(error),
+    };
+    *bind_attempts = 0;
     let mut events = PortalEvents {
         session: &session,
         bindings,
         requested: &requested,
         statuses,
         actions,
-        state: PortalState::default(),
+        state: PortalState::new(statuses.hold_owner()),
     };
     statuses.set_configuration_available(configuration_supported);
     events.refresh_grants(&shortcuts(&results));
@@ -308,7 +379,7 @@ async fn portal_session(
                 }
             },
             owner = owners.next().fuse() => {
-                if let Some(exit) = handle_owner_change(&mut events, owner, &mut owners).await? {
+                if let Some(exit) = handle_owner_change(&mut events, owner).await? {
                     return Ok(exit);
                 }
             },
@@ -329,30 +400,12 @@ async fn portal_session(
                     {
                         Ok(ShortcutList::Updated(list)) => events.refresh_grants(&list),
                         Ok(ShortcutList::Exit(exit)) => return Ok(exit),
-                        Err(PortalFailure::Denied) => {}
-                        Err(error @ PortalFailure::Transient(_)) => return Err(error),
+                        Err(error) => return Err(error),
                     }
                 }
             },
         }
     }
-}
-
-async fn wait_for_service_return<S>(owners: &mut S) -> Result<(), PortalFailure>
-where
-    S: futures_util::Stream<Item = zbus::fdo::NameOwnerChanged> + Unpin,
-{
-    while let Some(owner) = owners.next().await {
-        let (name, _, new_owner) = owner
-            .message()
-            .body()
-            .deserialize::<(String, String, String)>()
-            .map_err(|error| PortalFailure::Transient(error.into()))?;
-        if name == PORTAL && !new_owner.is_empty() {
-            return Ok(());
-        }
-    }
-    Err(PortalFailure::Transient(anyhow!("the session bus closed")))
 }
 
 fn portal_owner_restart(
@@ -373,32 +426,26 @@ fn portal_owner_restart(
     }
 }
 
-async fn handle_owner_change<S>(
+async fn handle_owner_change(
     events: &mut PortalEvents<'_>,
     owner: Option<zbus::fdo::NameOwnerChanged>,
-    owners: &mut S,
-) -> Result<Option<PortalExit>, PortalFailure>
-where
-    S: futures_util::Stream<Item = zbus::fdo::NameOwnerChanged> + Unpin,
-{
-    let unavailable = match portal_owner_restart(owner) {
-        Ok(Some(unavailable)) => unavailable,
-        Ok(None) => return Ok(None),
+) -> Result<Option<PortalExit>, PortalFailure> {
+    match portal_owner_restart(owner) {
+        Ok(Some(_)) => {
+            events.clear();
+            report_portal_unavailable(
+                events.bindings,
+                events.statuses,
+                "The desktop's global-shortcut service is restarting",
+            );
+            Ok(Some(PortalExit::Returned))
+        }
+        Ok(None) => Ok(None),
         Err(error) => {
             events.clear();
-            return Err(error);
+            Err(error)
         }
-    };
-    events.clear();
-    report_portal_unavailable(
-        events.bindings,
-        events.statuses,
-        "The desktop's global-shortcut service restarted",
-    );
-    if unavailable {
-        wait_for_service_return(owners).await?;
     }
-    Ok(Some(PortalExit::Returned))
 }
 
 async fn configuration_supported(connection: &Connection) -> bool {
@@ -491,15 +538,17 @@ where
                 match request_response(&message, &path) {
                     Ok(Some(results)) => return Ok(ShortcutList::Updated(shortcuts(&results))),
                     Ok(None) => {}
-                    Err(PortalFailure::Denied) => return Err(PortalFailure::Denied),
-                    Err(error @ PortalFailure::Transient(_)) => {
+                    Err(PortalFailure::Denied | PortalFailure::Ended(_)) => {
+                        // A failed listing does not revoke the active session's grants.
+                    }
+                    Err(error) => {
                         events.clear();
                         return Err(error);
                     }
                 }
             },
             owner = owners.next().fuse() => {
-                if let Some(exit) = handle_owner_change(events, owner, owners).await? {
+                if let Some(exit) = handle_owner_change(events, owner).await? {
                     return Ok(ShortcutList::Exit(exit));
                 }
             }
@@ -523,10 +572,10 @@ fn request_response(
         .body()
         .deserialize::<(u32, HashMap<String, OwnedValue>)>()
         .map_err(|error| PortalFailure::Transient(error.into()))?;
-    if code == 0 {
-        Ok(Some(results))
-    } else {
-        Err(PortalFailure::Denied)
+    match code {
+        0 => Ok(Some(results)),
+        1 => Err(PortalFailure::Denied),
+        code => Err(PortalFailure::Ended(code)),
     }
 }
 
@@ -569,17 +618,23 @@ fn shortcuts(results: &HashMap<String, OwnedValue>) -> Vec<(String, HashMap<Stri
         .unwrap_or_default()
 }
 
-#[derive(Default)]
 struct PortalState {
+    owner: super::HoldOwner,
     granted: [bool; 3],
     active: [bool; 3],
 }
 
 impl PortalState {
-    fn clear(&mut self) {
-        if self.active[Binding::Talk.index()] {
-            super::global_hold(false);
+    fn new(owner: super::HoldOwner) -> Self {
+        Self {
+            owner,
+            granted: [false; 3],
+            active: [false; 3],
         }
+    }
+
+    fn clear(&mut self) {
+        super::global_hold(self.owner, false);
         self.active = [false; 3];
     }
 
@@ -599,7 +654,7 @@ impl PortalState {
         }
         self.active[index] = pressed;
         match (binding, pressed) {
-            (Binding::Talk, held) => super::global_hold(held),
+            (Binding::Talk, held) => super::global_hold(self.owner, held),
             (Binding::ToggleStream, true) => actions.emit(Command::ToggleStream),
             (Binding::LeaveVoice, true) => actions.emit(Command::LeaveVoice),
             (_, false) => {}
@@ -644,7 +699,7 @@ fn update_grants(
     for binding in [Binding::Talk, Binding::ToggleStream, Binding::LeaveVoice] {
         let index = binding.index();
         if state.active[index] && !next[index] && binding == Binding::Talk {
-            super::global_hold(false);
+            super::global_hold(state.owner, false);
         }
         if !next[index] {
             state.active[index] = false;
@@ -775,9 +830,13 @@ fn report_x11_unavailable(bindings: &Bindings, statuses: &StatusReporter) {
     }
 }
 
-fn dispatch(edges: crate::push_to_talk::matcher::Edges, actions: &Actions) {
+fn dispatch(
+    edges: crate::push_to_talk::matcher::Edges,
+    statuses: &StatusReporter,
+    actions: &Actions,
+) {
     if let Some(held) = edges.talk {
-        super::global_hold(held);
+        statuses.hold(held);
     }
     for command in edges.commands() {
         actions.emit(command);
@@ -1040,18 +1099,26 @@ fn x11_worker(
                     if !event.flags.contains(xinput::KeyEventFlags::KEY_REPEAT)
                         && let Some(scancode) = event.detail.checked_sub(8)
                     {
-                        dispatch(matcher.event(event.sourceid, scancode, true), &actions);
+                        dispatch(
+                            matcher.event(event.sourceid, scancode, true),
+                            &statuses,
+                            &actions,
+                        );
                     }
                 }
                 Ok(Event::XinputRawKeyRelease(event)) => {
                     if !event.flags.contains(xinput::KeyEventFlags::KEY_REPEAT)
                         && let Some(scancode) = event.detail.checked_sub(8)
                     {
-                        dispatch(matcher.event(event.sourceid, scancode, false), &actions);
+                        dispatch(
+                            matcher.event(event.sourceid, scancode, false),
+                            &statuses,
+                            &actions,
+                        );
                     }
                 }
                 Ok(Event::XinputHierarchy(_)) => {
-                    dispatch(matcher.clear(), &actions);
+                    dispatch(matcher.clear(), &statuses, &actions);
                     let keymap = match current.connection.query_keymap() {
                         Ok(cookie) => match cookie.reply() {
                             Ok(keymap) => keymap,
@@ -1080,14 +1147,14 @@ fn x11_worker(
         if stop.stopped.load(Ordering::Relaxed) || outcome.is_none() {
             break;
         }
-        dispatch(matcher.clear(), &actions);
+        dispatch(matcher.clear(), &statuses, &actions);
         if let Some(error) = outcome {
             tracing::info!(%error, "lost the XInput connection; waiting before reconnecting");
         }
         report_x11_unavailable(&bindings, &statuses);
         session = None;
     }
-    dispatch(matcher.clear(), &actions);
+    dispatch(matcher.clear(), &statuses, &actions);
     *wake.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
 }
 
@@ -1170,6 +1237,9 @@ mod tests {
     #[test]
     #[ignore = "needs DISPLAY on a private X server and xdotool"]
     fn x11_delivers_chords_and_ptt_without_consuming_the_key() {
+        let _hold = crate::push_to_talk::HOLD_TEST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         assert_eq!(
             std::env::var("YAPFAST_TEST_PRIVATE_X11").as_deref(),
             Ok("1")
@@ -1231,14 +1301,16 @@ mod tests {
         wait_held(false);
         xdotool(&["keyup", "ctrl"]);
         drop(x11);
+        crate::push_to_talk::reset_hold_sources();
     }
 
     #[cfg(test)]
     mod portal_protocol_tests {
         use std::{
+            collections::VecDeque,
             sync::{
                 Arc,
-                atomic::{AtomicBool, Ordering},
+                atomic::{AtomicBool, AtomicU32, Ordering},
                 mpsc,
             },
             time::Instant,
@@ -1253,6 +1325,8 @@ mod tests {
             bind_requests: Option<mpsc::Sender<OwnedObjectPath>>,
             hold_session_response: AtomicBool,
             hold_bind_response: AtomicBool,
+            session_response_code: AtomicU32,
+            bind_response_codes: Mutex<VecDeque<u32>>,
         }
 
         #[zbus::interface(name = "org.freedesktop.portal.GlobalShortcuts")]
@@ -1277,7 +1351,8 @@ mod tests {
                 }
                 let session = format!("{PATH}/session/test/1");
                 let results = HashMap::from([("session_handle", Value::from(session))]);
-                respond(connection, &request, results).await;
+                let code = self.session_response_code.swap(0, Ordering::SeqCst);
+                respond(connection, &request, code, results).await;
                 request
             }
 
@@ -1320,9 +1395,16 @@ mod tests {
                 if self.hold_bind_response.swap(false, Ordering::SeqCst) {
                     return request;
                 }
+                let code = self
+                    .bind_response_codes
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(0);
                 respond(
                     connection,
                     &request,
+                    code,
                     HashMap::from([("shortcuts", Value::from(bound))]),
                 )
                 .await;
@@ -1393,6 +1475,7 @@ mod tests {
         async fn respond(
             connection: &Connection,
             request: &OwnedObjectPath,
+            code: u32,
             results: HashMap<&str, Value<'_>>,
         ) {
             connection
@@ -1401,7 +1484,7 @@ mod tests {
                     request,
                     "org.freedesktop.portal.Request",
                     "Response",
-                    &(0u32, results),
+                    &(code, results),
                 )
                 .await
                 .unwrap();
@@ -1492,6 +1575,20 @@ mod tests {
             }
         }
 
+        fn all_bindings() -> Bindings {
+            Bindings {
+                talk: Some(key(47, Some("v"))),
+                toggle_stream: Some(Chord {
+                    key: key(46, Some("c")),
+                    modifiers: crate::push_to_talk::ModifierMask::CTRL,
+                }),
+                leave_voice: Some(Chord {
+                    key: key(45, Some("x")),
+                    modifiers: crate::push_to_talk::ModifierMask::ALT,
+                }),
+            }
+        }
+
         #[test]
         #[ignore = "needs a private session bus and a Wayland session"]
         fn one_portal_session_binds_all_ids_and_emits_command_edges() {
@@ -1499,6 +1596,9 @@ mod tests {
                 is_wayland_session(),
                 "set WAYLAND_DISPLAY or XDG_SESSION_TYPE=wayland for the private portal scenario"
             );
+            let _hold = crate::push_to_talk::HOLD_TEST
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             crate::push_to_talk::reset_hold_sources();
 
             let server = zbus::blocking::connection::Builder::session()
@@ -1514,6 +1614,8 @@ mod tests {
                         bind_requests: None,
                         hold_session_response: AtomicBool::new(false),
                         hold_bind_response: AtomicBool::new(false),
+                        session_response_code: AtomicU32::new(0),
+                        bind_response_codes: Mutex::new(VecDeque::new()),
                     },
                 )
                 .unwrap()
@@ -1627,6 +1729,9 @@ mod tests {
                     );
                 }
             }
+            let _hold = crate::push_to_talk::HOLD_TEST
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let _reset = ResetPtt;
             crate::push_to_talk::reset_hold_sources();
             yapfast_core::push_to_talk::set_on(true);
@@ -1646,6 +1751,8 @@ mod tests {
                         bind_requests: None,
                         hold_session_response: AtomicBool::new(true),
                         hold_bind_response: AtomicBool::new(false),
+                        session_response_code: AtomicU32::new(0),
+                        bind_response_codes: Mutex::new(VecDeque::new()),
                     },
                 )
                 .unwrap()
@@ -1730,6 +1837,9 @@ mod tests {
                     );
                 }
             }
+            let _hold = crate::push_to_talk::HOLD_TEST
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let _reset = ResetPtt;
             crate::push_to_talk::reset_hold_sources();
             yapfast_core::push_to_talk::set_on(true);
@@ -1749,6 +1859,8 @@ mod tests {
                         bind_requests: Some(bind_requests),
                         hold_session_response: AtomicBool::new(false),
                         hold_bind_response: AtomicBool::new(true),
+                        session_response_code: AtomicU32::new(0),
+                        bind_response_codes: Mutex::new(VecDeque::new()),
                     },
                 )
                 .unwrap()
@@ -1810,11 +1922,516 @@ mod tests {
 
         #[test]
         #[ignore = "needs a private session bus and a Wayland session"]
+        fn portal_create_session_retries_after_response_ended() {
+            assert!(
+                is_wayland_session(),
+                "set WAYLAND_DISPLAY or XDG_SESSION_TYPE=wayland for the private portal scenario"
+            );
+            let _hold = crate::push_to_talk::HOLD_TEST
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (session_requests, requested_sessions) = mpsc::channel();
+            let server = zbus::blocking::connection::Builder::session()
+                .unwrap()
+                .name(PORTAL)
+                .unwrap()
+                .serve_at(
+                    PATH,
+                    FakePortal {
+                        version: 2,
+                        list_requests: None,
+                        session_requests: Some(session_requests),
+                        bind_requests: None,
+                        hold_session_response: AtomicBool::new(false),
+                        hold_bind_response: AtomicBool::new(false),
+                        session_response_code: AtomicU32::new(2),
+                        bind_response_codes: Mutex::new(VecDeque::new()),
+                    },
+                )
+                .unwrap()
+                .build()
+                .unwrap();
+            let bindings = Bindings {
+                talk: Some(key(47, Some("v"))),
+                ..Bindings::default()
+            };
+            let runtime = BackgroundRuntime::new().unwrap();
+            let watcher =
+                crate::push_to_talk::Watcher::start(bindings, &runtime, |_| {}, |_, _| {});
+
+            let _first = requested_sessions
+                .recv_timeout(Duration::from_secs(2))
+                .expect("the portal did not receive the first CreateSession");
+            wait_status(
+                &watcher,
+                Binding::Talk,
+                Reach::Focused("The desktop's global-shortcut service is unavailable"),
+            );
+            let _retry = requested_sessions
+                .recv_timeout(Duration::from_secs(2))
+                .expect("CreateSession response 2 did not retry");
+            wait_status(&watcher, Binding::Talk, Reach::Everywhere(Some("V".into())));
+            assert!(
+                requested_sessions
+                    .recv_timeout(Duration::from_millis(600))
+                    .is_err(),
+                "a successful CreateSession response must not restart setup"
+            );
+
+            drop(watcher);
+            drop(server);
+        }
+
+        #[test]
+        #[ignore = "needs a private session bus and a Wayland session"]
+        fn portal_bind_response_ended_retries_and_recovers() {
+            assert!(
+                is_wayland_session(),
+                "set WAYLAND_DISPLAY or XDG_SESSION_TYPE=wayland for the private portal scenario"
+            );
+            let _hold = crate::push_to_talk::HOLD_TEST
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (bind_requests, requested_binds) = mpsc::channel();
+            let server = zbus::blocking::connection::Builder::session()
+                .unwrap()
+                .name(PORTAL)
+                .unwrap()
+                .serve_at(
+                    PATH,
+                    FakePortal {
+                        version: 2,
+                        list_requests: None,
+                        session_requests: None,
+                        bind_requests: Some(bind_requests),
+                        hold_session_response: AtomicBool::new(false),
+                        hold_bind_response: AtomicBool::new(false),
+                        session_response_code: AtomicU32::new(0),
+                        bind_response_codes: Mutex::new(VecDeque::from([2, 0, 2, 0])),
+                    },
+                )
+                .unwrap()
+                .build()
+                .unwrap();
+            let bindings = Bindings {
+                talk: Some(key(47, Some("v"))),
+                ..Bindings::default()
+            };
+            let runtime = BackgroundRuntime::new().unwrap();
+            let watcher =
+                crate::push_to_talk::Watcher::start(bindings, &runtime, |_| {}, |_, _| {});
+
+            let _first = requested_binds
+                .recv_timeout(Duration::from_secs(2))
+                .expect("the portal did not receive BindShortcuts");
+            wait_status(
+                &watcher,
+                Binding::Talk,
+                Reach::Focused(
+                    "The desktop ended global-shortcut setup without granting shortcuts",
+                ),
+            );
+            let _retry = requested_binds
+                .recv_timeout(Duration::from_secs(2))
+                .expect("a non-cancellation BindShortcuts response did not retry");
+            wait_status(&watcher, Binding::Talk, Reach::Everywhere(Some("V".into())));
+            assert!(
+                requested_binds
+                    .recv_timeout(Duration::from_millis(600))
+                    .is_err(),
+                "a successful BindShortcuts response must not restart setup"
+            );
+            let release_reply = zbus::block_on(server.inner().call_method(
+                Some("org.freedesktop.DBus"),
+                "/org/freedesktop/DBus",
+                Some("org.freedesktop.DBus"),
+                "ReleaseName",
+                &(PORTAL,),
+            ))
+            .unwrap();
+            assert_eq!(release_reply.body().deserialize::<u32>().unwrap(), 1);
+            wait_status(
+                &watcher,
+                Binding::Talk,
+                Reach::Focused("The desktop's global-shortcut service is restarting"),
+            );
+
+            let request_reply = zbus::block_on(server.inner().call_method(
+                Some("org.freedesktop.DBus"),
+                "/org/freedesktop/DBus",
+                Some("org.freedesktop.DBus"),
+                "RequestName",
+                &(PORTAL, 0u32),
+            ))
+            .unwrap();
+            assert_eq!(request_reply.body().deserialize::<u32>().unwrap(), 1);
+            let _third = requested_binds
+                .recv_timeout(Duration::from_secs(2))
+                .expect("a successful BindShortcuts response did not reset the retry budget");
+            wait_status(
+                &watcher,
+                Binding::Talk,
+                Reach::Focused(
+                    "The desktop ended global-shortcut setup without granting shortcuts",
+                ),
+            );
+            let _fourth = requested_binds
+                .recv_timeout(Duration::from_secs(2))
+                .expect("the reset budget did not allow one retry");
+            wait_status(&watcher, Binding::Talk, Reach::Everywhere(Some("V".into())));
+            assert!(
+                requested_binds
+                    .recv_timeout(Duration::from_millis(600))
+                    .is_err(),
+                "a successful BindShortcuts response must not restart setup"
+            );
+
+            drop(watcher);
+            drop(server);
+        }
+
+        #[test]
+        #[ignore = "needs a private session bus and a Wayland session"]
+        fn portal_bind_stops_after_two_unsuccessful_requests() {
+            assert!(
+                is_wayland_session(),
+                "set WAYLAND_DISPLAY or XDG_SESSION_TYPE=wayland for the private portal scenario"
+            );
+            let _hold = crate::push_to_talk::HOLD_TEST
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (bind_requests, requested_binds) = mpsc::channel();
+            let server = zbus::blocking::connection::Builder::session()
+                .unwrap()
+                .name(PORTAL)
+                .unwrap()
+                .serve_at(
+                    PATH,
+                    FakePortal {
+                        version: 2,
+                        list_requests: None,
+                        session_requests: None,
+                        bind_requests: Some(bind_requests),
+                        hold_session_response: AtomicBool::new(false),
+                        hold_bind_response: AtomicBool::new(false),
+                        session_response_code: AtomicU32::new(0),
+                        bind_response_codes: Mutex::new(VecDeque::from([2, 2, 0])),
+                    },
+                )
+                .unwrap()
+                .build()
+                .unwrap();
+            let runtime = BackgroundRuntime::new().unwrap();
+            let watcher =
+                crate::push_to_talk::Watcher::start(all_bindings(), &runtime, |_| {}, |_, _| {});
+            watcher.set_commands_enabled(true);
+
+            let _first = requested_binds
+                .recv_timeout(Duration::from_secs(2))
+                .expect("the portal did not receive the first BindShortcuts");
+            wait_status(
+                &watcher,
+                Binding::Talk,
+                Reach::Focused(
+                    "The desktop ended global-shortcut setup without granting shortcuts",
+                ),
+            );
+            let _second = requested_binds
+                .recv_timeout(Duration::from_secs(2))
+                .expect("the first unsuccessful BindShortcuts did not retry once");
+            thread::sleep(Duration::from_millis(100));
+            wait_status(
+                &watcher,
+                Binding::Talk,
+                Reach::Focused(
+                    "The desktop ended global-shortcut setup without granting shortcuts",
+                ),
+            );
+            wait_status(
+                &watcher,
+                Binding::ToggleStream,
+                Reach::Unavailable(
+                    "The desktop ended global-shortcut setup without granting shortcuts",
+                ),
+            );
+            wait_status(
+                &watcher,
+                Binding::LeaveVoice,
+                Reach::Unavailable(
+                    "The desktop ended global-shortcut setup without granting shortcuts",
+                ),
+            );
+            assert!(
+                requested_binds
+                    .recv_timeout(Duration::from_millis(1200))
+                    .is_err(),
+                "the portal retried after two unsuccessful BindShortcuts requests"
+            );
+            assert_eq!(
+                watcher.status(Binding::Talk),
+                Reach::Focused(
+                    "The desktop ended global-shortcut setup without granting shortcuts",
+                )
+            );
+
+            drop(watcher);
+            drop(server);
+        }
+
+        #[test]
+        #[ignore = "needs a private session bus and a Wayland session"]
+        fn portal_bind_decline_is_terminal() {
+            assert!(
+                is_wayland_session(),
+                "set WAYLAND_DISPLAY or XDG_SESSION_TYPE=wayland for the private portal scenario"
+            );
+            let _hold = crate::push_to_talk::HOLD_TEST
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (bind_requests, requested_binds) = mpsc::channel();
+            let server = zbus::blocking::connection::Builder::session()
+                .unwrap()
+                .name(PORTAL)
+                .unwrap()
+                .serve_at(
+                    PATH,
+                    FakePortal {
+                        version: 2,
+                        list_requests: None,
+                        session_requests: None,
+                        bind_requests: Some(bind_requests),
+                        hold_session_response: AtomicBool::new(false),
+                        hold_bind_response: AtomicBool::new(false),
+                        session_response_code: AtomicU32::new(0),
+                        bind_response_codes: Mutex::new(VecDeque::from([1, 0])),
+                    },
+                )
+                .unwrap()
+                .build()
+                .unwrap();
+            let runtime = BackgroundRuntime::new().unwrap();
+            let watcher =
+                crate::push_to_talk::Watcher::start(all_bindings(), &runtime, |_| {}, |_, _| {});
+            watcher.set_commands_enabled(true);
+
+            let _first = requested_binds
+                .recv_timeout(Duration::from_secs(2))
+                .expect("the portal did not receive BindShortcuts");
+            wait_status(
+                &watcher,
+                Binding::Talk,
+                Reach::Focused("Your desktop declined global push to talk"),
+            );
+            wait_status(
+                &watcher,
+                Binding::ToggleStream,
+                Reach::Unavailable("Your desktop declined this global shortcut"),
+            );
+            wait_status(
+                &watcher,
+                Binding::LeaveVoice,
+                Reach::Unavailable("Your desktop declined this global shortcut"),
+            );
+            assert!(
+                requested_binds
+                    .recv_timeout(Duration::from_millis(800))
+                    .is_err(),
+                "a declined BindShortcuts request was retried"
+            );
+            assert_eq!(
+                watcher.status(Binding::Talk),
+                Reach::Focused("Your desktop declined global push to talk")
+            );
+
+            drop(watcher);
+            drop(server);
+        }
+
+        #[test]
+        #[ignore = "needs a private session bus and a Wayland session"]
+        fn portal_bind_owner_loss_consumes_retry_budget() {
+            assert!(
+                is_wayland_session(),
+                "set WAYLAND_DISPLAY or XDG_SESSION_TYPE=wayland for the private portal scenario"
+            );
+            let _hold = crate::push_to_talk::HOLD_TEST
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (bind_requests, requested_binds) = mpsc::channel();
+            let server = zbus::blocking::connection::Builder::session()
+                .unwrap()
+                .name(PORTAL)
+                .unwrap()
+                .serve_at(
+                    PATH,
+                    FakePortal {
+                        version: 2,
+                        list_requests: None,
+                        session_requests: None,
+                        bind_requests: Some(bind_requests),
+                        hold_session_response: AtomicBool::new(false),
+                        hold_bind_response: AtomicBool::new(true),
+                        session_response_code: AtomicU32::new(0),
+                        bind_response_codes: Mutex::new(VecDeque::from([2, 0])),
+                    },
+                )
+                .unwrap()
+                .build()
+                .unwrap();
+            let runtime = BackgroundRuntime::new().unwrap();
+            let watcher =
+                crate::push_to_talk::Watcher::start(all_bindings(), &runtime, |_| {}, |_, _| {});
+            watcher.set_commands_enabled(true);
+
+            let _first = requested_binds
+                .recv_timeout(Duration::from_secs(2))
+                .expect("the portal did not receive BindShortcuts");
+            thread::sleep(Duration::from_millis(100));
+            let release_reply = zbus::block_on(server.inner().call_method(
+                Some("org.freedesktop.DBus"),
+                "/org/freedesktop/DBus",
+                Some("org.freedesktop.DBus"),
+                "ReleaseName",
+                &(PORTAL,),
+            ))
+            .unwrap();
+            assert_eq!(release_reply.body().deserialize::<u32>().unwrap(), 1);
+            wait_status(
+                &watcher,
+                Binding::Talk,
+                Reach::Focused("The desktop's global-shortcut service is unavailable"),
+            );
+
+            let request_reply = zbus::block_on(server.inner().call_method(
+                Some("org.freedesktop.DBus"),
+                "/org/freedesktop/DBus",
+                Some("org.freedesktop.DBus"),
+                "RequestName",
+                &(PORTAL, 0u32),
+            ))
+            .unwrap();
+            assert_eq!(request_reply.body().deserialize::<u32>().unwrap(), 1);
+            let _second = requested_binds
+                .recv_timeout(Duration::from_secs(2))
+                .expect("the portal worker did not retry after owner loss");
+            wait_status(
+                &watcher,
+                Binding::Talk,
+                Reach::Focused(
+                    "The desktop ended global-shortcut setup without granting shortcuts",
+                ),
+            );
+            wait_status(
+                &watcher,
+                Binding::ToggleStream,
+                Reach::Unavailable(
+                    "The desktop ended global-shortcut setup without granting shortcuts",
+                ),
+            );
+            wait_status(
+                &watcher,
+                Binding::LeaveVoice,
+                Reach::Unavailable(
+                    "The desktop ended global-shortcut setup without granting shortcuts",
+                ),
+            );
+            assert!(
+                requested_binds
+                    .recv_timeout(Duration::from_millis(1200))
+                    .is_err(),
+                "owner loss did not consume a BindShortcuts attempt"
+            );
+
+            drop(watcher);
+            drop(server);
+        }
+
+        #[test]
+        #[ignore = "needs a private session bus and a Wayland session"]
+        fn portal_list_response_ended_preserves_active_grants() {
+            assert!(
+                is_wayland_session(),
+                "set WAYLAND_DISPLAY or XDG_SESSION_TYPE=wayland for the private portal scenario"
+            );
+            let _hold = crate::push_to_talk::HOLD_TEST
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            crate::push_to_talk::reset_hold_sources();
+            struct Reset;
+            impl Drop for Reset {
+                fn drop(&mut self) {
+                    yapfast_core::push_to_talk::set_on(false);
+                    yapfast_core::push_to_talk::set_release_delay(
+                        yapfast_core::push_to_talk::DEFAULT_RELEASE_DELAY,
+                    );
+                    crate::push_to_talk::reset_hold_sources();
+                }
+            }
+            let _reset = Reset;
+            yapfast_core::push_to_talk::set_on(true);
+            yapfast_core::push_to_talk::set_release_delay(0);
+
+            let (list_requests, requested_lists) = mpsc::channel();
+            let server = zbus::blocking::connection::Builder::session()
+                .unwrap()
+                .name(PORTAL)
+                .unwrap()
+                .serve_at(
+                    PATH,
+                    FakePortal {
+                        version: 2,
+                        list_requests: Some(list_requests),
+                        session_requests: None,
+                        bind_requests: None,
+                        hold_session_response: AtomicBool::new(false),
+                        hold_bind_response: AtomicBool::new(false),
+                        session_response_code: AtomicU32::new(0),
+                        bind_response_codes: Mutex::new(VecDeque::new()),
+                    },
+                )
+                .unwrap()
+                .build()
+                .unwrap();
+            let bindings = Bindings {
+                talk: Some(key(47, Some("v"))),
+                ..Bindings::default()
+            };
+            let runtime = BackgroundRuntime::new().unwrap();
+            let watcher =
+                crate::push_to_talk::Watcher::start(bindings, &runtime, |_| {}, |_, _| {});
+            wait_status(&watcher, Binding::Talk, Reach::Everywhere(Some("V".into())));
+            assert!(watcher.configure_shortcuts());
+            let request = requested_lists
+                .recv_timeout(Duration::from_secs(2))
+                .expect("the portal did not request its shortcut list");
+            let session = OwnedObjectPath::try_from(format!("{PATH}/session/test/1")).unwrap();
+
+            zbus::block_on(respond(server.inner(), &request, 2, HashMap::new()));
+            zbus::block_on(press(server.inner(), &session, TALK_ID, "Activated"));
+            wait_held(true);
+            assert_eq!(
+                watcher.status(Binding::Talk),
+                Reach::Everywhere(Some("V".into()))
+            );
+            assert!(yapfast_core::push_to_talk::sending());
+            zbus::block_on(press(server.inner(), &session, TALK_ID, "Deactivated"));
+            wait_held(false);
+            assert!(!yapfast_core::push_to_talk::sending());
+
+            drop(watcher);
+            drop(server);
+        }
+
+        #[test]
+        #[ignore = "needs a private session bus and a Wayland session"]
         fn v2_list_wait_processes_session_signals() {
             assert!(
                 is_wayland_session(),
                 "set WAYLAND_DISPLAY or XDG_SESSION_TYPE=wayland for the private portal scenario"
             );
+            let _hold = crate::push_to_talk::HOLD_TEST
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             crate::push_to_talk::reset_hold_sources();
             yapfast_core::push_to_talk::set_on(true);
             yapfast_core::push_to_talk::set_release_delay(0);
@@ -1833,6 +2450,8 @@ mod tests {
                         bind_requests: None,
                         hold_session_response: AtomicBool::new(false),
                         hold_bind_response: AtomicBool::new(false),
+                        session_response_code: AtomicU32::new(0),
+                        bind_response_codes: Mutex::new(VecDeque::new()),
                     },
                 )
                 .unwrap()
@@ -1891,6 +2510,7 @@ mod tests {
             zbus::block_on(respond(
                 server.inner(),
                 &first_list,
+                0,
                 list_results("SHIFT+V"),
             ));
             assert!(watcher.configure_shortcuts());
@@ -1915,7 +2535,7 @@ mod tests {
             wait_status(
                 &watcher,
                 Binding::Talk,
-                Reach::Focused("The desktop's global-shortcut service restarted"),
+                Reach::Focused("The desktop's global-shortcut service is restarting"),
             );
             focused_window_key(slint::winit_030::winit::event::ElementState::Pressed);
             assert!(yapfast_core::push_to_talk::held());
@@ -1930,14 +2550,20 @@ mod tests {
             ))
             .unwrap();
             assert_eq!(request_reply.body().deserialize::<u32>().unwrap(), 1);
-            wait_status(
-                &watcher,
-                Binding::Talk,
-                Reach::Focused("The desktop's global-shortcut service closed this session"),
-            );
-            // An old list response from the restarted service must not restore its grants.
-            zbus::block_on(respond(server.inner(), &second_list, list_results("STALE")));
             wait_status(&watcher, Binding::Talk, Reach::Everywhere(Some("W".into())));
+            // An old list response from the restarted service must not restore its grants.
+            zbus::block_on(respond(
+                server.inner(),
+                &second_list,
+                0,
+                list_results("STALE"),
+            ));
+            wait_status(&watcher, Binding::Talk, Reach::Everywhere(Some("W".into())));
+            wait_held(false);
+            assert!(
+                !yapfast_core::push_to_talk::sending(),
+                "grant recovery must not leave the microphone transmitting"
+            );
             focused_window_key(slint::winit_030::winit::event::ElementState::Released);
             assert!(
                 !yapfast_core::push_to_talk::held(),
@@ -1947,7 +2573,7 @@ mod tests {
                 !yapfast_core::push_to_talk::sending(),
                 "grant recovery must not leave the microphone transmitting"
             );
-            crate::push_to_talk::global_hold(true);
+            watcher.statuses.hold(true);
             watcher
                 .statuses
                 .set(Binding::Talk, Reach::Focused("fallback source test"));
@@ -1971,7 +2597,7 @@ mod tests {
                 "focused cleanup must preserve the independent global hold"
             );
             assert!(yapfast_core::push_to_talk::sending());
-            crate::push_to_talk::global_hold(false);
+            watcher.statuses.hold(false);
             wait_held(false);
             assert!(!yapfast_core::push_to_talk::sending());
             let stale_grant = Reach::Everywhere(Some("STALE".into()));

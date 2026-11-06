@@ -517,22 +517,32 @@ secure desktops and session locks cannot be overridden.
 
 | Desktop | Backend and limits |
 | --- | --- |
-| Wayland | In sessions identified by `WAYLAND_DISPLAY` or `XDG_SESSION_TYPE=wayland`, including Xwayland clients, one xdg-desktop-portal GlobalShortcuts session binds the configured action IDs and offers preferred triggers. Settings show actual grants and desktop-assigned keys, not an assumed assignment. Activated/Deactivated hold PTT and delimit command presses. The live desktop editor requires portal version 2; version 1 still supports the shortcuts, with assignments managed by the desktop. Without portal GlobalShortcuts, background commands are unavailable; the app does not report focused-only XInput as global support. |
+| Wayland | In sessions identified by `WAYLAND_DISPLAY` or `XDG_SESSION_TYPE=wayland`, including Xwayland clients, one xdg-desktop-portal GlobalShortcuts session binds the configured action IDs and offers preferred triggers. Settings show actual grants and desktop-assigned keys, not an assumed assignment. Activated/Deactivated hold PTT and delimit command presses. The live desktop editor requires portal version 2; version 1 still supports the shortcuts, with assignments managed by the desktop. Without portal GlobalShortcuts, background commands are unavailable; the app does not report focused-only XInput as global support. On portal-owner loss, Yapfast clears grants and held keys and retries setup with capped backoff, including while no owner is present. Response 1 (user cancellation) is terminal; other nonzero setup responses, including code 2 during CreateSession or BindShortcuts, report service unavailable and retry with capped backoff rather than reporting a user decline. A nonzero ListShortcuts response does not discard current grants. |
 | X11 | XInput 2.1 raw key events on the root window, including while another client holds a keyboard grab. Keys also reach the focused app. Initial held keys and device changes are synchronized without synthesizing command presses. |
-| Windows | Commands use Winit's application-lifetime Raw Input receiver with `RIDEV_INPUTSINK`, including with no Yapfast window. A subclass of that receiver handles directly delivered session and suspend/resume messages; command availability requires the subclass and notification registrations. The original keyboard registration is restored on teardown. Native Windows background-input, fullscreen, and session-transition behavior has not been verified. PTT's low-level hook may miss input in elevated applications under Windows' integrity restrictions; Raw Input delivery with an elevated foreground application is unverified. |
+| Windows | Commands use Winit's application-lifetime Raw Input receiver with `RIDEV_INPUTSINK`, including with no Yapfast window. A subclass of that receiver handles directly delivered session and suspend/resume messages; command availability requires the subclass and notification registrations. PTT-only global-hook mode also installs session, power and desktop-switch monitors without enabling the raw-input sink; if monitoring is unavailable, PTT falls back to focused-window input. The original keyboard registration is restored on teardown. Native Windows background-input, fullscreen, and session-transition behavior has not been verified. PTT's low-level hook may miss input in elevated applications under Windows' integrity restrictions; Raw Input delivery with an elevated foreground application is unverified. |
 
 When background input is unavailable, only PTT can fall back to focused-window
-events; settings say it is focused-only and losing focus releases it.
-Command chords never use a focused-only fallback.
+events; settings say it is focused-only. Focus loss, window detachment and
+backend changes release focused holds. Global and focused holds are aggregated,
+so releasing one source cannot cancel the other. Command chords never use a
+focused-only fallback.
 
 The watcher belongs to the application, not a window or selected channel, and
 routes commands to the current call while minimized or closed to the tray.
 Recording suppresses commands until it ends. Rebinding replaces the old
-watcher; stale queued callbacks cannot execute through the replacement.
-Only one instance per OS user and desktop session owns command delivery, even
-when another instance uses a different data directory. Losing the portal
-service clears its grants and held keys before reconnecting; an explicit
-permission denial does not repeatedly prompt.
+watcher; stale queued callbacks cannot execute through the replacement, and
+stale hold writes from the old watcher are ignored. Only one instance per OS
+user and desktop session owns command delivery, even when another instance uses
+a different data directory. Portal-owner loss clears its grants and held keys
+before retrying setup. Response 1 (user cancellation) is terminal.
+Non-cancellation CreateSession failures retry with capped backoff and do not
+consume the BindShortcuts budget. A successful BindShortcuts response resets
+a two-request budget: one initial request and at most one retry. Every sent
+BindShortcuts request that does not return code 0, including owner loss while
+waiting, consumes one attempt. After two unsuccessful requests, the worker
+stops; PTT remains focused-only and command shortcuts stay unavailable.
+Changing bindings or restarting Yapfast creates a new watcher. An explicit
+portal Session.Closed remains terminal.
 
 `x11_delivers_chords_and_ptt_without_consuming_the_key` exercises a separate
 client's keyboard grab on a private X server.
@@ -540,11 +550,23 @@ The sequential `test-x11` stage in `scripts/check` runs this regression under
 Xvfb with synthetic `xdotool` events.
 `one_portal_session_binds_all_ids_and_emits_command_edges` exercises PTT,
 command edge deduplication, missing and changing assignment descriptions, and
-the version-1 editor limit on a private bus.
-The `portal_setup_retries_after_owner_restart_*` tests cover recovery while
+the version-1 editor limit on a private bus. The
+`portal_setup_retries_after_owner_restart_*` tests cover recovery while
 CreateSession and BindShortcuts responses are pending.
-`v2_list_wait_processes_session_signals` covers portal signals, stale responses,
-and PTT hold ownership during a list wait.
+`portal_create_session_retries_after_response_ended` covers retrying a
+non-cancellation CreateSession response.
+`portal_bind_response_ended_retries_and_recovers` covers retry after response
+2, successful global assignment recovery, and budget reset after owner restart.
+`portal_bind_stops_after_two_unsuccessful_requests`,
+`portal_bind_decline_is_terminal` and
+`portal_bind_owner_loss_consumes_retry_budget` cover the retry limit, user
+cancellation, and interrupted-request accounting.
+`v2_list_wait_processes_session_signals` covers portal signals, stale responses
+and focused/global PTT hold cleanup before the fallback key-up.
+`portal_list_response_ended_preserves_active_grants` confirms that a nonzero
+`ListShortcuts` response does not revoke working grants.
+`ptt_only_hook_installs_session_transition_monitors` checks that Windows PTT-only
+setup installs notifications without enabling a Raw Input sink.
 
 `global_hotkey_owner_excludes_other_adapters_until_release` verifies lock
 contention and lease release/reacquisition between application adapters.

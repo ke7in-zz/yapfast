@@ -271,15 +271,35 @@ struct StatusState {
     configuration_available: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct HoldOwner(u64);
+
+impl HoldOwner {
+    #[cfg(windows)]
+    pub(super) fn id(self) -> u64 {
+        self.0
+    }
+
+    #[cfg(windows)]
+    pub(super) fn from_id(id: u64) -> Self {
+        Self(id)
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct StatusReporter {
     values: Arc<Mutex<StatusState>>,
     callback: StatusCallback,
     talk_scancode: Option<u32>,
+    hold_owner: HoldOwner,
 }
 
 impl StatusReporter {
-    fn new(bindings: &Bindings, told: impl Fn(Binding, Reach) + Send + Sync + 'static) -> Self {
+    pub(super) fn new(
+        bindings: &Bindings,
+        told: impl Fn(Binding, Reach) + Send + Sync + 'static,
+    ) -> Self {
+        let hold_owner = claim_hold_sources();
         Self {
             values: Arc::new(Mutex::new(StatusState {
                 reach: [
@@ -292,7 +312,15 @@ impl StatusReporter {
             })),
             callback: Arc::new(told),
             talk_scancode: bindings.talk.as_ref().map(|key| key.scancode),
+            hold_owner,
         }
+    }
+    pub(super) fn hold_owner(&self) -> HoldOwner {
+        self.hold_owner
+    }
+
+    pub(super) fn hold(&self, held: bool) {
+        global_hold(self.hold_owner, held);
     }
 
     pub(super) fn asking(&self, bindings: &Bindings) {
@@ -304,6 +332,14 @@ impl StatusReporter {
     }
 
     pub(super) fn set(&self, binding: Binding, reach: Reach) {
+        if binding == Binding::Talk {
+            let scancode = if matches!(&reach, Reach::Focused(_)) {
+                self.talk_scancode
+            } else {
+                None
+            };
+            set_focused_scancode(self.hold_owner, scancode);
+        }
         let changed = {
             let mut values = self
                 .values
@@ -317,14 +353,6 @@ impl StatusReporter {
                 true
             }
         };
-        if binding == Binding::Talk {
-            let scancode = if matches!(&reach, Reach::Focused(_)) {
-                self.talk_scancode
-            } else {
-                None
-            };
-            set_focused_scancode(scancode);
-        }
         if changed {
             (self.callback)(binding, reach);
         }
@@ -513,18 +541,79 @@ impl Reach {
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 struct HoldSources {
+    owner: u64,
     global: bool,
     focused: bool,
     focused_scancode: Option<u32>,
 }
 
 static HOLD_SOURCES: Mutex<HoldSources> = Mutex::new(HoldSources {
+    owner: 0,
     global: false,
     focused: false,
     focused_scancode: None,
 });
 
-fn change_hold_sources(change: impl FnOnce(&mut HoldSources)) {
+#[cfg(test)]
+pub(crate) static HOLD_TEST: Mutex<()> = Mutex::new(());
+
+fn next_hold_owner(owner: u64) -> u64 {
+    owner.wrapping_add(1).max(1)
+}
+
+fn claim_hold_sources() -> HoldOwner {
+    let mut sources = HOLD_SOURCES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    sources.owner = next_hold_owner(sources.owner);
+    sources.global = false;
+    sources.focused = false;
+    sources.focused_scancode = None;
+    yapfast_core::push_to_talk::hold(false);
+    HoldOwner(sources.owner)
+}
+
+fn release_hold_sources(owner: HoldOwner) {
+    let mut sources = HOLD_SOURCES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if sources.owner != owner.0 {
+        return;
+    }
+    sources.owner = next_hold_owner(sources.owner);
+    sources.global = false;
+    sources.focused = false;
+    sources.focused_scancode = None;
+    yapfast_core::push_to_talk::hold(false);
+}
+fn change_hold_sources(owner: HoldOwner, change: impl FnOnce(&mut HoldSources)) {
+    let mut sources = HOLD_SOURCES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if sources.owner != owner.0 {
+        return;
+    }
+    let previous = *sources;
+    change(&mut sources);
+    if *sources != previous {
+        yapfast_core::push_to_talk::hold(sources.global || sources.focused);
+    }
+}
+
+pub(super) fn global_hold(owner: HoldOwner, held: bool) {
+    change_hold_sources(owner, |sources| sources.global = held);
+}
+
+fn set_focused_scancode(owner: HoldOwner, scancode: Option<u32>) {
+    change_hold_sources(owner, |sources| {
+        if sources.focused_scancode != scancode {
+            sources.focused = false;
+            sources.focused_scancode = scancode;
+        }
+    });
+}
+
+fn change_current_hold_sources(change: impl FnOnce(&mut HoldSources)) {
     let mut sources = HOLD_SOURCES
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -535,21 +624,8 @@ fn change_hold_sources(change: impl FnOnce(&mut HoldSources)) {
     }
 }
 
-pub(super) fn global_hold(held: bool) {
-    change_hold_sources(|sources| sources.global = held);
-}
-
-fn set_focused_scancode(scancode: Option<u32>) {
-    change_hold_sources(|sources| {
-        if sources.focused_scancode != scancode {
-            sources.focused = false;
-            sources.focused_scancode = scancode;
-        }
-    });
-}
-
-fn clear_focused_hold() {
-    change_hold_sources(|sources| sources.focused = false);
+pub(super) fn clear_focused_hold() {
+    change_current_hold_sources(|sources| sources.focused = false);
 }
 
 // Winit 0.30.13 keeps `KeyEvent`'s fields private, so tests drive this
@@ -561,18 +637,22 @@ pub(super) fn focused_key_event(scancode: Option<u32>, state: ElementState, repe
     let Some(scancode) = scancode else {
         return;
     };
-    change_hold_sources(|sources| {
+    change_current_hold_sources(|sources| {
         if sources.focused_scancode == Some(scancode) {
             sources.focused = state == ElementState::Pressed;
         }
     });
 }
 
+#[cfg(test)]
 pub(super) fn reset_hold_sources() {
     let mut sources = HOLD_SOURCES
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *sources = HoldSources::default();
+    sources.owner = next_hold_owner(sources.owner);
+    sources.global = false;
+    sources.focused = false;
+    sources.focused_scancode = None;
     yapfast_core::push_to_talk::hold(false);
 }
 
@@ -607,7 +687,6 @@ impl Watcher {
         command: impl Fn(Command) + Send + Sync + 'static,
         told: impl Fn(Binding, Reach) + Send + Sync + 'static,
     ) -> Self {
-        reset_hold_sources();
         let statuses = StatusReporter::new(&bindings, told);
         statuses.asking(&bindings);
         let actions = Actions::new(command);
@@ -687,6 +766,46 @@ impl Drop for Watcher {
     fn drop(&mut self) {
         #[cfg(any(target_os = "linux", windows))]
         drop(self._global.take());
+        release_hold_sources(self.statuses.hold_owner);
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_watcher_hold_writes_cannot_override_current_owner() {
+        let _hold = HOLD_TEST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let bindings = Bindings {
+            talk: Some(Keybind {
+                scancode: 47,
+                name: "V".into(),
+                trigger: None,
+            }),
+            ..Bindings::default()
+        };
+        let stale = StatusReporter::new(&bindings, |_, _| {});
+        stale.hold(true);
+        assert!(yapfast_core::push_to_talk::held());
+
+        let current = StatusReporter::new(&bindings, |_, _| {});
+        assert!(!yapfast_core::push_to_talk::held());
+        stale.hold(true);
+        assert!(
+            !yapfast_core::push_to_talk::held(),
+            "a prior watcher cannot assert a hold after replacement"
+        );
+
+        current.hold(true);
+        stale.hold(false);
+        assert!(
+            yapfast_core::push_to_talk::held(),
+            "a prior watcher cannot release the current owner's hold"
+        );
+        current.hold(false);
+        assert!(!yapfast_core::push_to_talk::held());
         reset_hold_sources();
     }
 }

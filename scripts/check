@@ -55,6 +55,12 @@ run_portal_test() {
     push_to_talk::linux::tests::portal_protocol_tests::one_portal_session_binds_all_ids_and_emits_command_edges \
     push_to_talk::linux::tests::portal_protocol_tests::portal_setup_retries_after_owner_restart_during_create_session \
     push_to_talk::linux::tests::portal_protocol_tests::portal_setup_retries_after_owner_restart_during_bind_shortcuts \
+    push_to_talk::linux::tests::portal_protocol_tests::portal_create_session_retries_after_response_ended \
+    push_to_talk::linux::tests::portal_protocol_tests::portal_bind_response_ended_retries_and_recovers \
+    push_to_talk::linux::tests::portal_protocol_tests::portal_bind_stops_after_two_unsuccessful_requests \
+    push_to_talk::linux::tests::portal_protocol_tests::portal_bind_decline_is_terminal \
+    push_to_talk::linux::tests::portal_protocol_tests::portal_bind_owner_loss_consumes_retry_budget \
+    push_to_talk::linux::tests::portal_protocol_tests::portal_list_response_ended_preserves_active_grants \
     push_to_talk::linux::tests::portal_protocol_tests::v2_list_wait_processes_session_signals; do
     CC=clang CXX=clang++ CARGO_BUILD_JOBS=2 \
       "$dbus/bin/dbus-run-session" --dbus-daemon="$dbus/bin/dbus-daemon" \

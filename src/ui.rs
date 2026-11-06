@@ -1819,6 +1819,11 @@ impl Adapter {
         let models = Models::default();
         models.attach(window);
         let layout = Layout::read(&root);
+        // Adapter construction applies the process-wide PTT mode.
+        #[cfg(test)]
+        let _ptt_test = crate::push_to_talk::HOLD_TEST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         layout.apply(window);
         let mut app = Application::default();
         app.remember_reaction_uses(layout.reactions.clone());

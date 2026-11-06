@@ -3,7 +3,7 @@ use std::{
     ptr,
     sync::{
         Arc, LazyLock, Mutex,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         mpsc,
     },
     thread::{self, JoinHandle},
@@ -88,6 +88,7 @@ struct Input {
     wts_registered: bool,
     win_event_hook: Option<usize>,
     power_notification: Option<isize>,
+    ptt_hook_installed: bool,
 }
 
 impl Input {
@@ -104,11 +105,16 @@ impl Input {
             wts_registered: false,
             win_event_hook: None,
             power_notification: None,
+            ptt_hook_installed: false,
         }
     }
 
     fn has_commands(&self) -> bool {
         self.bindings.toggle_stream.is_some() || self.bindings.leave_voice.is_some()
+    }
+
+    fn watches_transitions(&self) -> bool {
+        self.has_commands() || (self.ptt_hook_installed && self.bindings.talk.is_some())
     }
 
     fn command_status(&self, reach: Reach) {
@@ -121,9 +127,31 @@ impl Input {
         }
     }
 
+    fn ptt_monitoring(&self, ready: bool) {
+        if !self.ptt_hook_installed || self.bindings.talk.is_none() {
+            return;
+        }
+        PTT_ENABLED.store(ready, Ordering::Release);
+        if let Some(statuses) = &self.statuses {
+            if ready {
+                statuses.set(Binding::Talk, Reach::Everywhere(None));
+            } else {
+                statuses.hold(false);
+                statuses.set(
+                    Binding::Talk,
+                    Reach::Focused(
+                        "Windows could not monitor session, desktop, and power transitions safely",
+                    ),
+                );
+            }
+        }
+    }
+
     fn reset_matcher(&mut self) {
         let _ = self.matcher.clear();
-        super::global_hold(false);
+        if let Some(statuses) = &self.statuses {
+            statuses.hold(false);
+        }
     }
 
     fn synchronize_keys(&mut self) {
@@ -172,7 +200,14 @@ impl Shared {
         }
     }
 
-    fn configure(&self, bindings: Bindings, statuses: StatusReporter, actions: Actions) {
+    fn configure(
+        &self,
+        bindings: Bindings,
+        statuses: StatusReporter,
+        actions: Actions,
+        ptt_hook_installed: bool,
+    ) -> bool {
+        PTT_ENABLED.store(false, Ordering::Release);
         let mut input = self
             .input
             .lock()
@@ -180,26 +215,31 @@ impl Shared {
         input.reset_matcher();
         input.matcher = Matcher::new(command_bindings(&bindings), ModifierLayout::WindowsSet1);
         input.bindings = bindings;
+        input.ptt_hook_installed = ptt_hook_installed;
         input.actions = Some(actions);
         input.statuses = Some(statuses);
-        if !input.has_commands() {
+        if !input.watches_transitions() {
             restore_input_sink(&mut input);
             unregister_notifications(&mut input);
-            return;
+            return false;
         }
         if !self.handler_installed.load(Ordering::Acquire) {
             input.command_status(Reach::Unavailable(
                 "Yapfast's Windows global-input handler isn't installed",
             ));
-            return;
+            input.ptt_monitoring(false);
+            return false;
         }
         if !discover_receiver(&mut input) {
             input.command_status(Reach::Unavailable(
                 "Winit did not register a keyboard raw-input receiver",
             ));
-            return;
+            input.ptt_monitoring(false);
+            return false;
         }
-        activate(&mut input);
+        let monitoring_ready = activate(&mut input);
+        input.ptt_monitoring(monitoring_ready);
+        monitoring_ready
     }
 
     fn key(&self, device: DeviceId, scancode: u32, pressed: bool) {
@@ -254,12 +294,14 @@ impl Shared {
         if input.target != Some(target) {
             return;
         }
+        PTT_ENABLED.store(false, Ordering::Release);
         input.reset_matcher();
         let restored = restore_input_sink(&mut input);
         let notifications_unregistered = unregister_notifications(&mut input);
         input.command_status(Reach::Unavailable(
             "Windows' global-input receiver was destroyed",
         ));
+        input.ptt_monitoring(false);
         if restored && notifications_unregistered {
             input.original = None;
             input.target = None;
@@ -274,19 +316,23 @@ impl Shared {
             .input
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !input.has_commands() {
+        if !input.watches_transitions() {
             return;
         }
+        PTT_ENABLED.store(false, Ordering::Release);
         if !discover_receiver(&mut input) {
             input.command_status(Reach::Unavailable(
                 "Winit did not register a keyboard raw-input receiver",
             ));
+            input.ptt_monitoring(false);
             return;
         }
-        activate(&mut input);
+        let monitoring_ready = activate(&mut input);
+        input.ptt_monitoring(monitoring_ready);
     }
 
     fn clear_watcher(&self) -> bool {
+        PTT_ENABLED.store(false, Ordering::Release);
         let mut input = self
             .input
             .lock()
@@ -298,6 +344,7 @@ impl Shared {
         input.matcher = Matcher::new(Bindings::default(), ModifierLayout::WindowsSet1);
         input.actions = None;
         input.statuses = None;
+        input.ptt_hook_installed = false;
         restored && notifications_unregistered
     }
 
@@ -386,7 +433,7 @@ fn discover_receiver(input: &mut Input) -> bool {
     true
 }
 
-fn activate(input: &mut Input) {
+fn activate(input: &mut Input) -> bool {
     if let Some(target) = input.target {
         if !input.subclass_installed {
             // SAFETY: This is Winit's live receiver HWND on the event-loop thread.
@@ -426,7 +473,7 @@ fn activate(input: &mut Input) {
             }
         }
     }
-    if input.has_commands()
+    if input.watches_transitions()
         && (!input.subclass_installed
             || !input.wts_registered
             || input.win_event_hook.is_none()
@@ -436,18 +483,18 @@ fn activate(input: &mut Input) {
         input.command_status(Reach::Unavailable(
             "Windows could not monitor session, desktop, and power transitions safely",
         ));
-        return;
+        return false;
     }
 
     if !input.has_commands() {
         restore_input_sink(input);
-        return;
+        return true;
     }
     let Some(original) = input.original else {
         input.command_status(Reach::Unavailable(
             "Winit did not register a keyboard raw-input receiver",
         ));
-        return;
+        return false;
     };
     if !input.input_sink {
         let keyboard = RAWINPUTDEVICE {
@@ -471,6 +518,7 @@ fn activate(input: &mut Input) {
             "Windows did not enable background keyboard raw input",
         ));
     }
+    true
 }
 
 fn restore_input_sink(input: &mut Input) -> bool {
@@ -610,7 +658,13 @@ impl Global {
             .talk
             .as_ref()
             .and_then(|key| Hook::start(key.scancode, statuses.clone()));
-        shared().configure(bindings.clone(), statuses, actions);
+        if bindings.talk.is_some() && hook.is_none() {
+            statuses.set(
+                Binding::Talk,
+                Reach::Focused("Windows didn't let Yapfast watch keys in other apps"),
+            );
+        }
+        shared().configure(bindings.clone(), statuses, actions, hook.is_some());
         Self { _hook: hook }
     }
 }
@@ -681,10 +735,14 @@ impl CustomApplicationHandler for InputHandler {
 struct Hook {
     thread: u32,
     join: Option<JoinHandle<()>>,
+    owner: super::HoldOwner,
 }
 
 impl Hook {
     fn start(scancode: u32, statuses: StatusReporter) -> Option<Self> {
+        let owner = statuses.hold_owner();
+        PTT_ENABLED.store(false, Ordering::Release);
+        PTT_OWNER.store(owner.id(), Ordering::Release);
         PTT_KEY.store(scancode, Ordering::Relaxed);
         let (started, ready) = mpsc::sync_channel(1);
         let join = thread::Builder::new()
@@ -712,15 +770,14 @@ impl Hook {
             })
             .ok()?;
         match ready.recv().ok().flatten() {
-            Some(thread) => {
-                statuses.set(Binding::Talk, Reach::Everywhere(None));
-                Some(Self {
-                    thread,
-                    join: Some(join),
-                })
-            }
+            Some(thread) => Some(Self {
+                thread,
+                join: Some(join),
+                owner,
+            }),
             None => {
                 let _ = join.join();
+                PTT_KEY.store(u32::MAX, Ordering::Relaxed);
                 statuses.set(
                     Binding::Talk,
                     Reach::Focused("Windows didn't let Yapfast watch keys in other apps"),
@@ -733,6 +790,7 @@ impl Hook {
 
 impl Drop for Hook {
     fn drop(&mut self) {
+        PTT_ENABLED.store(false, Ordering::Release);
         PTT_KEY.store(u32::MAX, Ordering::Relaxed);
         // SAFETY: Posting WM_QUIT to the hook thread ends its message loop.
         unsafe {
@@ -741,11 +799,13 @@ impl Drop for Hook {
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
-        super::global_hold(false);
+        super::global_hold(self.owner, false);
     }
 }
 
 static PTT_KEY: AtomicU32 = AtomicU32::new(u32::MAX);
+static PTT_OWNER: AtomicU64 = AtomicU64::new(0);
+static PTT_ENABLED: AtomicBool = AtomicBool::new(false);
 
 unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code == HC_ACTION as i32 {
@@ -756,10 +816,13 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
         } else {
             0
         };
-        if key.scanCode | extended == PTT_KEY.load(Ordering::Relaxed) {
+        if PTT_ENABLED.load(Ordering::Acquire)
+            && key.scanCode | extended == PTT_KEY.load(Ordering::Relaxed)
+        {
+            let owner = super::HoldOwner::from_id(PTT_OWNER.load(Ordering::Acquire));
             match wparam as u32 {
-                WM_KEYDOWN | WM_SYSKEYDOWN => super::global_hold(true),
-                WM_KEYUP | WM_SYSKEYUP => super::global_hold(false),
+                WM_KEYDOWN | WM_SYSKEYDOWN => super::global_hold(owner, true),
+                WM_KEYUP | WM_SYSKEYUP => super::global_hold(owner, false),
                 _ => {}
             }
         }
@@ -816,6 +879,60 @@ mod tests {
         assert_eq!(count.load(Ordering::Relaxed), 0);
     }
 
+    #[test]
+    #[ignore = "needs a native Windows desktop"]
+    fn ptt_only_hook_installs_session_transition_monitors() {
+        let _hold = crate::push_to_talk::HOLD_TEST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut builder = EventLoop::builder();
+        builder.with_any_thread(true);
+        let _events = builder.build().unwrap();
+        let before =
+            keyboard_registration().expect("Winit's keyboard receiver must be discoverable");
+        let bindings = Bindings {
+            talk: Some(super::super::Keybind {
+                scancode: 0x2f,
+                name: "V".into(),
+                trigger: None,
+            }),
+            ..Bindings::default()
+        };
+        let mut input = Input::new();
+        input.original = Some(before);
+        input.target = Some(before.target);
+        input.bindings = bindings.clone();
+        input.ptt_hook_installed = true;
+        input.statuses = Some(StatusReporter::new(&bindings, |_, _| {}));
+        assert!(input.watches_transitions());
+
+        struct Restore(Input);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                PTT_ENABLED.store(false, Ordering::Release);
+                restore_input_sink(&mut self.0);
+                unregister_notifications(&mut self.0);
+            }
+        }
+        let mut guard = Restore(input);
+        assert!(activate(&mut guard.0));
+        assert!(guard.0.subclass_installed);
+        assert!(guard.0.wts_registered);
+        assert!(guard.0.win_event_hook.is_some());
+        assert!(guard.0.power_notification.is_some());
+        assert!(
+            !guard.0.input_sink,
+            "PTT-only setup must not enable raw input"
+        );
+        guard.0.ptt_monitoring(true);
+        assert_eq!(
+            guard.0.statuses.as_ref().unwrap().get(Binding::Talk),
+            Reach::Everywhere(None)
+        );
+        drop(guard);
+        crate::push_to_talk::reset_hold_sources();
+    }
+
     /// Exercises the real two-call Win32 query; a null-buffer size query
     /// returns INSUFFICIENT_BUFFER, not a successful element count.
     #[test]
@@ -860,6 +977,9 @@ mod tests {
     #[test]
     #[ignore = "injects keys into the interactive Windows desktop"]
     fn the_ptt_hook_observes_down_up_and_ignores_other_keys() {
+        let _hold = crate::push_to_talk::HOLD_TEST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         struct Reset;
         impl Drop for Reset {
             fn drop(&mut self) {
@@ -879,6 +999,7 @@ mod tests {
         };
         let hook = Hook::start(0x2f, StatusReporter::new(&bindings, |_, _| {}))
             .expect("Windows did not install the PTT hook");
+        PTT_ENABLED.store(true, Ordering::Release);
         send_key(0x2f, false);
         wait_held(true);
         send_key(0x2f, true);
@@ -919,6 +1040,9 @@ mod tests {
     #[test]
     #[ignore = "needs a native Windows desktop and sends messages to Winit's input HWND"]
     fn sent_session_and_power_messages_clear_modifier_state() {
+        let _hold = crate::push_to_talk::HOLD_TEST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _handler = custom_application_handler();
         let mut builder = EventLoop::builder();
         builder.with_any_thread(true);
@@ -994,5 +1118,6 @@ mod tests {
         key(0x26, true);
         assert_eq!(count.load(Ordering::Relaxed), 1);
         drop(global);
+        crate::push_to_talk::reset_hold_sources();
     }
 }

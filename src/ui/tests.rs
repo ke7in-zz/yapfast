@@ -399,6 +399,10 @@ fn the_keyboard_steps_through_messages_and_acts_on_them() {
 
 #[test]
 fn preferences_set_the_clock_text_size_previews_and_unmuting() {
+    let _hold = crate::push_to_talk::HOLD_TEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
     i_slint_backend_testing::init_no_event_loop();
     let message = ChatMessage {
         timestamp: 1_791_329_400,
@@ -525,6 +529,10 @@ fn preferences_set_the_clock_text_size_previews_and_unmuting() {
 
 #[test]
 fn push_to_talk_keeps_its_mode_key_and_release_delay() {
+    let _hold = crate::push_to_talk::HOLD_TEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
     i_slint_backend_testing::init_no_event_loop();
     let defaults: Layout = serde_json::from_str("{}").unwrap();
     assert_eq!(defaults.input_mode, InputMode::VoiceActivity);
@@ -553,6 +561,10 @@ fn push_to_talk_keeps_its_mode_key_and_release_delay() {
 
 #[test]
 fn each_sounds_own_volume_counts_only_while_adjusting_each() {
+    let _hold = crate::push_to_talk::HOLD_TEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
     i_slint_backend_testing::init_no_event_loop();
     let defaults: Layout = serde_json::from_str("{}").unwrap();
     assert_eq!(defaults.sound_set, SoundSet::NewKalimba);
@@ -610,6 +622,10 @@ fn the_renderer_setting_is_remembered() {
     )
     .unwrap();
     bind_callbacks(&window, &adapter);
+    let _hold = crate::push_to_talk::HOLD_TEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
     // Software unless chosen.
     assert!(!window.get_gpu_rendering());
     window.set_gpu_rendering(true);
@@ -716,6 +732,10 @@ fn call_volumes_play_while_dragged_and_are_remembered() {
     )
     .unwrap();
     bind_callbacks(&window, &adapter);
+    let _hold = crate::push_to_talk::HOLD_TEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
     assert_eq!(window.get_microphone_volume(), 100, "as it comes");
     assert_eq!(window.get_speaker_volume(), 100);
     window.set_microphone_volume(200);
@@ -754,6 +774,10 @@ fn sound_settings_are_remembered() {
     )
     .unwrap();
     bind_callbacks(&window, &adapter);
+    let _hold = crate::push_to_talk::HOLD_TEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
     window.set_sound_set(4);
     window.set_sound_volume(40);
     window.set_adjust_each_sound(true);

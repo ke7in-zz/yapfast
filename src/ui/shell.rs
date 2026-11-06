@@ -431,6 +431,7 @@ impl Adapter {
     /// The window closed: what only it used stops with it. The models stay, so
     /// the next window shows them without building them again.
     pub(super) fn detach(&mut self) {
+        crate::push_to_talk::clear_focused_hold();
         self.meter = None;
         #[cfg(feature = "discord")]
         {

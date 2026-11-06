@@ -614,6 +614,49 @@ mod tests {
     }
 
     #[test]
+    fn detaching_window_releases_focused_ptt_hold() {
+        let (directory, _, adapter) = fixture();
+        let _hold = crate::push_to_talk::HOLD_TEST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                yapfast_core::push_to_talk::set_on(false);
+                yapfast_core::push_to_talk::set_release_delay(
+                    yapfast_core::push_to_talk::DEFAULT_RELEASE_DELAY,
+                );
+                crate::push_to_talk::reset_hold_sources();
+            }
+        }
+        let _reset = Reset;
+        yapfast_core::push_to_talk::set_on(true);
+        yapfast_core::push_to_talk::set_release_delay(0);
+        let bindings = Bindings {
+            talk: Some(crate::push_to_talk::Keybind {
+                scancode: 47,
+                name: "V".into(),
+                trigger: None,
+            }),
+            ..Bindings::default()
+        };
+        let statuses = crate::push_to_talk::StatusReporter::new(&bindings, |_, _| {});
+        statuses.set(
+            Binding::Talk,
+            crate::push_to_talk::Reach::Focused("test fallback"),
+        );
+        crate::push_to_talk::focused_key_event(Some(47), ElementState::Pressed, false);
+        assert!(yapfast_core::push_to_talk::held());
+        assert!(yapfast_core::push_to_talk::sending());
+
+        adapter.borrow_mut().detach();
+
+        assert!(!yapfast_core::push_to_talk::held());
+        assert!(!yapfast_core::push_to_talk::sending());
+        drop(directory);
+    }
+
+    #[test]
     fn command_bindings_persist_and_conflicts_preserve_both_keys() {
         let (directory, _, adapter) = fixture();
         let stored = chord(47, ModifierMask::CTRL | ModifierMask::SHIFT);
