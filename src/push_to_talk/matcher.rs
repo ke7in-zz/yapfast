@@ -29,7 +29,7 @@ impl ModifierLayout {
         (slot < KEYS).then_some(slot)
     }
 
-    #[cfg(any(target_os = "windows", test))]
+    #[cfg(any(target_os = "windows", target_os = "linux", test))]
     fn scancode(self, slot: usize) -> u32 {
         match self {
             Self::Evdev => slot as u32,
@@ -147,6 +147,34 @@ impl<D: Eq + Hash> Matcher<D> {
         }
     }
 
+    /// Releases seeded keys that the keyboard no longer reports down. A seed
+    /// whose release was lost, because its device left, must not swallow the
+    /// next press of that key.
+    #[cfg(any(target_os = "linux", test))]
+    pub fn retain_seeded(&mut self, down: impl IntoIterator<Item = u32>) -> Edges {
+        let mut reported = [0; WORDS];
+        for scancode in down {
+            if let Some(slot) = self.layout.slot(scancode) {
+                insert(&mut reported, slot);
+            }
+        }
+        let mut edges = Edges::default();
+        for (word, keys) in self.seeded.into_iter().enumerate() {
+            let mut bits = keys & !reported[word];
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let slot = word * 64 + bit;
+                remove(&mut self.seeded, slot);
+                self.counts[slot] = self.counts[slot].saturating_sub(1);
+                if self.counts[slot] == 0 {
+                    self.up_into(self.layout.scancode(slot), &mut edges);
+                }
+            }
+        }
+        edges
+    }
+
     /// Starts an input source with no keys currently down.
     #[cfg(target_os = "windows")]
     pub fn add_device(&mut self, device: D) {
@@ -155,7 +183,7 @@ impl<D: Eq + Hash> Matcher<D> {
 
     /// Drops all keys attributed to one device, emitting only genuine final
     /// releases after other keyboards' state has been accounted for.
-    #[cfg(any(target_os = "windows", test))]
+    #[cfg(any(target_os = "windows", target_os = "linux", test))]
     pub fn remove_device(&mut self, device: &D) -> Edges {
         let Some(keys) = self.devices.remove(device) else {
             return Edges::default();
@@ -340,6 +368,27 @@ mod tests {
         matcher.event(2, 47, true);
         assert!(matcher.remove_device(&1).talk.is_none());
         assert_eq!(matcher.remove_device(&2).talk, Some(false));
+    }
+
+    #[test]
+    fn removing_an_unrelated_device_keeps_the_talk_hold() {
+        let mut matcher = Matcher::new(bindings(), ModifierLayout::Evdev);
+        assert_eq!(matcher.event(1, 47, true).talk, Some(true));
+        assert_eq!(matcher.remove_device(&2), Edges::default());
+        assert_eq!(matcher.event(1, 47, false).talk, Some(false));
+    }
+
+    #[test]
+    fn retain_seeded_releases_only_keys_no_longer_reported_down() {
+        let mut matcher = Matcher::new(bindings(), ModifierLayout::Evdev);
+        matcher.seed_down([29, 47]);
+        assert_eq!(matcher.retain_seeded([29]), Edges::default());
+        let edges = matcher.event(1, 47, true);
+        assert_eq!(edges.talk, Some(true));
+        assert_eq!(
+            edges.commands().collect::<Vec<_>>(),
+            [Command::ToggleStream]
+        );
     }
 
     #[test]

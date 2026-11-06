@@ -93,6 +93,9 @@ const LEAVE_ID: &str = "leave-voice";
 
 const MAX_BIND_SHORTCUTS_ATTEMPTS: u8 = 2;
 
+const BIND_SETUP_STOPPED: &str =
+    "Global shortcut setup stopped after repeated failed requests; restart Yapfast to try again";
+
 fn any_binding(bindings: &Bindings) -> bool {
     bindings.talk.is_some() || bindings.toggle_stream.is_some() || bindings.leave_voice.is_some()
 }
@@ -206,14 +209,15 @@ async fn portal_worker(
                     code,
                     "the desktop ended BindShortcuts without granting shortcuts"
                 );
+                if bind_attempts >= MAX_BIND_SHORTCUTS_ATTEMPTS {
+                    report_portal_unavailable(&bindings, &statuses, BIND_SETUP_STOPPED);
+                    return;
+                }
                 report_portal_unavailable(
                     &bindings,
                     &statuses,
                     "The desktop ended global-shortcut setup without granting shortcuts",
                 );
-                if bind_attempts >= MAX_BIND_SHORTCUTS_ATTEMPTS {
-                    return;
-                }
             }
             Err(PortalFailure::Transient(error)) => {
                 tracing::info!(%error, "the global-shortcut service is unavailable");
@@ -225,14 +229,15 @@ async fn portal_worker(
             }
             Err(PortalFailure::BindTransient(error)) => {
                 tracing::info!(%error, "BindShortcuts did not complete");
+                if bind_attempts >= MAX_BIND_SHORTCUTS_ATTEMPTS {
+                    report_portal_unavailable(&bindings, &statuses, BIND_SETUP_STOPPED);
+                    return;
+                }
                 report_portal_unavailable(
                     &bindings,
                     &statuses,
                     "The desktop's global-shortcut service is unavailable",
                 );
-                if bind_attempts >= MAX_BIND_SHORTCUTS_ATTEMPTS {
-                    return;
-                }
             }
         }
         tokio::time::sleep(backoff).await;
@@ -399,6 +404,7 @@ async fn portal_session(
                     .await
                     {
                         Ok(ShortcutList::Updated(list)) => events.refresh_grants(&list),
+                        Ok(ShortcutList::Unlisted) => {}
                         Ok(ShortcutList::Exit(exit)) => return Ok(exit),
                         Err(error) => return Err(error),
                     }
@@ -483,6 +489,8 @@ async fn configure_shortcuts(connection: &Connection, session: &OwnedObjectPath)
 
 enum ShortcutList {
     Updated(Vec<(String, HashMap<String, OwnedValue>)>),
+    // The desktop refused or ended the listing; the session keeps its grants.
+    Unlisted,
     Exit(PortalExit),
 }
 
@@ -539,7 +547,7 @@ where
                     Ok(Some(results)) => return Ok(ShortcutList::Updated(shortcuts(&results))),
                     Ok(None) => {}
                     Err(PortalFailure::Denied | PortalFailure::Ended(_)) => {
-                        // A failed listing does not revoke the active session's grants.
+                        return Ok(ShortcutList::Unlisted);
                     }
                     Err(error) => {
                         events.clear();
@@ -830,6 +838,19 @@ fn report_x11_unavailable(bindings: &Bindings, statuses: &StatusReporter) {
     }
 }
 
+fn held_scancodes(keymap: &xproto::QueryKeymapReply) -> impl Iterator<Item = u32> + '_ {
+    keymap
+        .keys
+        .iter()
+        .enumerate()
+        .flat_map(|(byte_index, byte)| {
+            (0..8).filter_map(move |bit| {
+                let keycode = byte_index * 8 + bit;
+                ((*byte & (1 << bit) != 0) && keycode >= 8).then_some((keycode - 8) as u32)
+            })
+        })
+}
+
 fn dispatch(
     edges: crate::push_to_talk::matcher::Edges,
     statuses: &StatusReporter,
@@ -966,17 +987,7 @@ impl X11Session {
         connection
             .flush()
             .map_err(|error| X11Failure::Transient(error.into()))?;
-        let seeded = keymap
-            .keys
-            .iter()
-            .enumerate()
-            .flat_map(|(byte_index, byte)| {
-                (0..8).filter_map(move |bit| {
-                    let keycode = byte_index * 8 + bit;
-                    ((*byte & (1 << bit) != 0) && keycode >= 8).then_some((keycode - 8) as u32)
-                })
-            })
-            .collect();
+        let seeded = held_scancodes(&keymap).collect();
         Ok(Self {
             connection: Arc::new(connection),
             window,
@@ -1117,27 +1128,33 @@ fn x11_worker(
                         );
                     }
                 }
-                Ok(Event::XinputHierarchy(_)) => {
-                    dispatch(matcher.clear(), &statuses, &actions);
-                    let keymap = match current.connection.query_keymap() {
-                        Ok(cookie) => match cookie.reply() {
-                            Ok(keymap) => keymap,
+                Ok(Event::XinputHierarchy(event)) => {
+                    // Only a removed, detached, or disabled source takes its keys with it;
+                    // other hierarchy changes leave held keys alone.
+                    let mut removed = false;
+                    for info in &event.infos {
+                        if info.flags.contains(xinput::HierarchyMask::SLAVE_REMOVED)
+                            || info.flags.contains(xinput::HierarchyMask::SLAVE_DETACHED)
+                            || info.flags.contains(xinput::HierarchyMask::DEVICE_DISABLED)
+                        {
+                            removed = true;
+                            dispatch(matcher.remove_device(&info.deviceid), &statuses, &actions);
+                        }
+                    }
+                    if removed {
+                        let keymap = match current.connection.query_keymap() {
+                            Ok(cookie) => match cookie.reply() {
+                                Ok(keymap) => keymap,
+                                Err(error) => break Some(error.into()),
+                            },
                             Err(error) => break Some(error.into()),
-                        },
-                        Err(error) => break Some(error.into()),
-                    };
-                    let seeded = keymap
-                        .keys
-                        .iter()
-                        .enumerate()
-                        .flat_map(|(byte_index, byte)| {
-                            (0..8).filter_map(move |bit| {
-                                let keycode = byte_index * 8 + bit;
-                                ((*byte & (1 << bit) != 0) && keycode >= 8)
-                                    .then_some((keycode - 8) as u32)
-                            })
-                        });
-                    matcher.seed_down(seeded);
+                        };
+                        dispatch(
+                            matcher.retain_seeded(held_scancodes(&keymap)),
+                            &statuses,
+                            &actions,
+                        );
+                    }
                 }
                 Ok(Event::ClientMessage(_)) if stop.stopped.load(Ordering::Relaxed) => break None,
                 Ok(_) => {}
@@ -2140,26 +2157,16 @@ mod tests {
                 .recv_timeout(Duration::from_secs(2))
                 .expect("the first unsuccessful BindShortcuts did not retry once");
             thread::sleep(Duration::from_millis(100));
-            wait_status(
-                &watcher,
-                Binding::Talk,
-                Reach::Focused(
-                    "The desktop ended global-shortcut setup without granting shortcuts",
-                ),
-            );
+            wait_status(&watcher, Binding::Talk, Reach::Focused(BIND_SETUP_STOPPED));
             wait_status(
                 &watcher,
                 Binding::ToggleStream,
-                Reach::Unavailable(
-                    "The desktop ended global-shortcut setup without granting shortcuts",
-                ),
+                Reach::Unavailable(BIND_SETUP_STOPPED),
             );
             wait_status(
                 &watcher,
                 Binding::LeaveVoice,
-                Reach::Unavailable(
-                    "The desktop ended global-shortcut setup without granting shortcuts",
-                ),
+                Reach::Unavailable(BIND_SETUP_STOPPED),
             );
             assert!(
                 requested_binds
@@ -2169,9 +2176,7 @@ mod tests {
             );
             assert_eq!(
                 watcher.status(Binding::Talk),
-                Reach::Focused(
-                    "The desktop ended global-shortcut setup without granting shortcuts",
-                )
+                Reach::Focused(BIND_SETUP_STOPPED)
             );
 
             drop(watcher);
@@ -2314,26 +2319,16 @@ mod tests {
             let _second = requested_binds
                 .recv_timeout(Duration::from_secs(2))
                 .expect("the portal worker did not retry after owner loss");
-            wait_status(
-                &watcher,
-                Binding::Talk,
-                Reach::Focused(
-                    "The desktop ended global-shortcut setup without granting shortcuts",
-                ),
-            );
+            wait_status(&watcher, Binding::Talk, Reach::Focused(BIND_SETUP_STOPPED));
             wait_status(
                 &watcher,
                 Binding::ToggleStream,
-                Reach::Unavailable(
-                    "The desktop ended global-shortcut setup without granting shortcuts",
-                ),
+                Reach::Unavailable(BIND_SETUP_STOPPED),
             );
             wait_status(
                 &watcher,
                 Binding::LeaveVoice,
-                Reach::Unavailable(
-                    "The desktop ended global-shortcut setup without granting shortcuts",
-                ),
+                Reach::Unavailable(BIND_SETUP_STOPPED),
             );
             assert!(
                 requested_binds
@@ -2417,6 +2412,10 @@ mod tests {
             zbus::block_on(press(server.inner(), &session, TALK_ID, "Deactivated"));
             wait_held(false);
             assert!(!yapfast_core::push_to_talk::sending());
+            assert!(watcher.configure_shortcuts());
+            requested_lists.recv_timeout(Duration::from_secs(2)).expect(
+                "a failed ListShortcuts left the session unable to service ConfigureShortcuts",
+            );
 
             drop(watcher);
             drop(server);

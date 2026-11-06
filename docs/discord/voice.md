@@ -513,12 +513,13 @@ independent of push to talk.
 
 `src/push_to_talk.rs` shares one native input source for the configured
 bindings. Desktop policy still applies: permissions, reserved shortcuts,
-secure desktops and session locks cannot be overridden.
+secure desktops cannot be overridden. Session locks are not observed on X11;
+see its row.
 
 | Desktop | Backend and limits |
 | --- | --- |
 | Wayland | In sessions identified by `WAYLAND_DISPLAY` or `XDG_SESSION_TYPE=wayland`, including Xwayland clients, one xdg-desktop-portal GlobalShortcuts session binds the configured action IDs and offers preferred triggers. Settings show actual grants and desktop-assigned keys, not an assumed assignment. Activated/Deactivated hold PTT and delimit command presses. The live desktop editor requires portal version 2; version 1 still supports the shortcuts, with assignments managed by the desktop. Without portal GlobalShortcuts, background commands are unavailable; the app does not report focused-only XInput as global support. On portal-owner loss, Yapfast clears grants and held keys and retries setup with capped backoff, including while no owner is present. Response 1 (user cancellation) is terminal; other nonzero setup responses, including code 2 during CreateSession or BindShortcuts, report service unavailable and retry with capped backoff rather than reporting a user decline. A nonzero ListShortcuts response does not discard current grants. |
-| X11 | XInput 2.1 raw key events on the root window, including while another client holds a keyboard grab. Keys also reach the focused app. Initial held keys and device changes are synchronized without synthesizing command presses. |
+| X11 | XInput 2.1 raw key events on the root window, including while another client holds a keyboard grab. Keys also reach the focused app. Initial held keys and device changes are synchronized without synthesizing command presses. Session locks are not observed: raw events ignore keyboard grabs, so commands and PTT still fire while the screen is locked. A real desktop locker has not been tested. |
 | Windows | Commands use Winit's application-lifetime Raw Input receiver with `RIDEV_INPUTSINK`, including with no Yapfast window. A subclass of that receiver handles directly delivered session and suspend/resume messages; command availability requires the subclass and notification registrations. PTT-only global-hook mode also installs session, power and desktop-switch monitors without enabling the raw-input sink; if monitoring is unavailable, PTT falls back to focused-window input. The original keyboard registration is restored on teardown. Native Windows background-input, fullscreen, and session-transition behavior has not been verified. PTT's low-level hook may miss input in elevated applications under Windows' integrity restrictions; Raw Input delivery with an elevated foreground application is unverified. |
 
 When background input is unavailable, only PTT can fall back to focused-window
@@ -526,6 +527,12 @@ events; settings say it is focused-only. Focus loss, window detachment and
 backend changes release focused holds. Global and focused holds are aggregated,
 so releasing one source cannot cancel the other. Command chords never use a
 focused-only fallback.
+
+Removing an input device releases the holds it may own. On X11 that is the keys
+the device reported down, plus startup-held keys the keyboard no longer reports
+down; detached or disabled devices count too. On Windows any device removal,
+even a mouse, releases a global PTT hold; the PTT key must be released before it
+talks again.
 
 The watcher belongs to the application, not a window or selected channel, and
 routes commands to the current call while minimized or closed to the tray.

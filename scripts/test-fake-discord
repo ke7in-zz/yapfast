@@ -14,7 +14,8 @@
 # target/fake-discord.log. Then it does the same for fake_env.rs, against
 # a fake running testing/envs/example.json, whose log is
 # target/fake-discord-env.log.
-# The game-stream test uses a private, null-only PulseAudio server.
+# The game-stream tests share a private, null-only PulseAudio server; each gets
+# a fake of its own.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
@@ -130,29 +131,38 @@ start_fake target/fake-discord-env.log --env testing/envs/example.json
 YAPFAST_DISCORD_TEST_SERVER=$server \
   cargo test --locked --profile fast -p yapfast-discord --test fake_env -- --ignored "$@"
 
-game_stream_test=discord_audio::tests::game_stream_hotkey_fails_closed_and_toggles_only_a_recognized_game
-run_game_stream_test=1
-if (( $# > 0 )); then
-  run_game_stream_test=0
+game_stream_tests=(
+  discord_audio::tests::game_stream_hotkey_fails_closed_and_toggles_only_a_recognized_game
+  discord_audio::tests::pending_game_stream_scan_is_cancelled_by_stop_toggle_and_leave
+)
+selected_game_stream_tests=()
+for game_stream_test in "${game_stream_tests[@]}"; do
+  if (( $# == 0 )); then
+    selected_game_stream_tests+=("$game_stream_test")
+    continue
+  fi
   for filter in "$@"; do
     if [[ $game_stream_test == *"$filter"* ]]; then
-      run_game_stream_test=1
+      selected_game_stream_tests+=("$game_stream_test")
       break
     fi
   done
-fi
-if (( run_game_stream_test )); then
+done
+if (( ${#selected_game_stream_tests[@]} > 0 )); then
   CARGO_BUILD_JOBS=2 cargo build --locked --profile fast -p yapfast
-  start_fake target/fake-discord-game-stream.log
   start_null_audio
-  PULSE_SERVER="$pulse_server" \
-  PULSE_SINK=yapfast_hotkey_output \
-  PULSE_SOURCE=yapfast_hotkey_input.monitor \
-  YAPFAST_DISCORD_TEST_SERVER="$server" \
-  YAPFAST_DISCORD_GAMES_FILE=/dev/null \
-  YAPFAST_STREAM_WORKER="$PWD/target/fast/yapfast" \
-  YAPFAST_STREAM_TEST_PATTERN=1 \
-    env -u DISPLAY -u WAYLAND_DISPLAY -u XDG_SESSION_TYPE \
-      CARGO_BUILD_JOBS=2 cargo test --locked --profile fast -p yapfast-core \
-        "$game_stream_test" -- --ignored --exact --test-threads=1
+  for game_stream_test in "${selected_game_stream_tests[@]}"; do
+    # A fake keeps the streams it received, so each test gets one of its own.
+    start_fake "target/fake-discord-${game_stream_test##*::}.log"
+    PULSE_SERVER="$pulse_server" \
+    PULSE_SINK=yapfast_hotkey_output \
+    PULSE_SOURCE=yapfast_hotkey_input.monitor \
+    YAPFAST_DISCORD_TEST_SERVER="$server" \
+    YAPFAST_DISCORD_GAMES_FILE=/dev/null \
+    YAPFAST_STREAM_WORKER="$PWD/target/fast/yapfast" \
+    YAPFAST_STREAM_TEST_PATTERN=1 \
+      env -u DISPLAY -u WAYLAND_DISPLAY -u XDG_SESSION_TYPE \
+        CARGO_BUILD_JOBS=2 cargo test --locked --profile fast -p yapfast-core \
+          "$game_stream_test" -- --ignored --exact --test-threads=1
+  done
 fi

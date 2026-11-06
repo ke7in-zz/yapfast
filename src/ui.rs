@@ -104,10 +104,52 @@ pub fn run(
         open_link,
     );
     #[cfg(windows)]
-    if !crate::push_to_talk::windows_teardown() {
-        anyhow::bail!("Windows could not release Yapfast's background keyboard registration.");
+    let result =
+        preserve_result_after_windows_teardown(result, crate::push_to_talk::windows_teardown);
+    result
+}
+
+#[cfg(windows)]
+fn preserve_result_after_windows_teardown(
+    result: Result<Exit>,
+    teardown: impl FnOnce() -> bool,
+) -> Result<Exit> {
+    if !teardown() {
+        tracing::error!("Windows could not release Yapfast's background keyboard registration.");
     }
     result
+}
+
+#[cfg(all(test, windows))]
+mod windows_teardown_tests {
+    use super::*;
+
+    #[test]
+    fn renderer_exit_survives_windows_teardown_failure() {
+        assert!(matches!(
+            preserve_result_after_windows_teardown(Ok(Exit::Restart), || false).unwrap(),
+            Exit::Restart
+        ));
+        assert!(matches!(
+            preserve_result_after_windows_teardown(
+                Ok(Exit::UseSoftware("GPU failure".into())),
+                || false
+            )
+            .unwrap(),
+            Exit::UseSoftware(reason) if reason == "GPU failure"
+        ));
+    }
+
+    #[test]
+    fn original_run_error_survives_windows_teardown_failure() {
+        let original = std::io::Error::other("original run error");
+        let result = preserve_result_after_windows_teardown(Err(original.into()), || false);
+        let Err(error) = result else {
+            panic!("teardown replaced the original run error");
+        };
+        assert!(error.downcast_ref::<std::io::Error>().is_some());
+        assert_eq!(error.to_string(), "original run error");
+    }
 }
 
 fn run_inner(

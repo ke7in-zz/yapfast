@@ -543,6 +543,10 @@ impl Reach {
 struct HoldSources {
     owner: u64,
     global: bool,
+    /// Windows only: set when a device removal ends a global hold, so the same
+    /// press cannot restart it until its key comes up. Always false elsewhere.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    global_blocked: bool,
     focused: bool,
     focused_scancode: Option<u32>,
 }
@@ -550,6 +554,7 @@ struct HoldSources {
 static HOLD_SOURCES: Mutex<HoldSources> = Mutex::new(HoldSources {
     owner: 0,
     global: false,
+    global_blocked: false,
     focused: false,
     focused_scancode: None,
 });
@@ -567,6 +572,7 @@ fn claim_hold_sources() -> HoldOwner {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     sources.owner = next_hold_owner(sources.owner);
     sources.global = false;
+    sources.global_blocked = false;
     sources.focused = false;
     sources.focused_scancode = None;
     yapfast_core::push_to_talk::hold(false);
@@ -583,6 +589,7 @@ fn release_hold_sources(owner: HoldOwner) {
     sources.owner = next_hold_owner(sources.owner);
     sources.global = false;
     sources.focused = false;
+    sources.global_blocked = false;
     sources.focused_scancode = None;
     yapfast_core::push_to_talk::hold(false);
 }
@@ -602,6 +609,30 @@ fn change_hold_sources(owner: HoldOwner, change: impl FnOnce(&mut HoldSources)) 
 
 pub(super) fn global_hold(owner: HoldOwner, held: bool) {
     change_hold_sources(owner, |sources| sources.global = held);
+}
+
+#[cfg(windows)]
+pub(super) fn global_key(owner: HoldOwner, down: bool) {
+    change_hold_sources(owner, |sources| {
+        if down {
+            if !sources.global_blocked {
+                sources.global = true;
+            }
+        } else {
+            sources.global = false;
+            sources.global_blocked = false;
+        }
+    });
+}
+
+#[cfg(windows)]
+pub(super) fn invalidate_global_hold(owner: HoldOwner) {
+    change_hold_sources(owner, |sources| {
+        if sources.global {
+            sources.global = false;
+            sources.global_blocked = true;
+        }
+    });
 }
 
 fn set_focused_scancode(owner: HoldOwner, scancode: Option<u32>) {
@@ -652,6 +683,7 @@ pub(super) fn reset_hold_sources() {
     sources.owner = next_hold_owner(sources.owner);
     sources.global = false;
     sources.focused = false;
+    sources.global_blocked = false;
     sources.focused_scancode = None;
     yapfast_core::push_to_talk::hold(false);
 }
@@ -806,6 +838,36 @@ mod tests {
         );
         current.hold(false);
         assert!(!yapfast_core::push_to_talk::held());
+        reset_hold_sources();
+    }
+
+    #[test]
+    fn releasing_a_watcher_clears_its_focused_hold() {
+        let _hold = HOLD_TEST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let bindings = Bindings {
+            talk: Some(Keybind {
+                scancode: 47,
+                name: "V".into(),
+                trigger: None,
+            }),
+            ..Bindings::default()
+        };
+        let watcher = StatusReporter::new(&bindings, |_, _| {});
+        set_focused_scancode(watcher.hold_owner(), Some(47));
+        focused_key_event(Some(47), ElementState::Pressed, false);
+        assert!(yapfast_core::push_to_talk::held());
+
+        release_hold_sources(watcher.hold_owner());
+        assert!(!yapfast_core::push_to_talk::held());
+        assert!(
+            !HOLD_SOURCES
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .focused,
+            "releasing a watcher must clear its focused hold source"
+        );
         reset_hold_sources();
     }
 }

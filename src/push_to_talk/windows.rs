@@ -277,6 +277,13 @@ impl Shared {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _ = input.matcher.remove_device(device);
+        // Winit's device ID is opaque and removal may be a mouse. Release a
+        // held hook source conservatively for any device removal.
+        if input.ptt_hook_installed
+            && let Some(statuses) = &input.statuses
+        {
+            super::invalidate_global_hold(statuses.hold_owner());
+        }
     }
 
     fn clear_stale(&self) {
@@ -689,18 +696,8 @@ struct InputHandler {
     shared: Arc<Shared>,
 }
 
-impl CustomApplicationHandler for InputHandler {
-    fn resumed(&mut self, _event_loop: &ActiveEventLoop) -> EventResult {
-        self.shared.resumed();
-        EventResult::Propagate
-    }
-
-    fn device_event(
-        &mut self,
-        _event_loop: &ActiveEventLoop,
-        device_id: DeviceId,
-        event: DeviceEvent,
-    ) -> EventResult {
+impl InputHandler {
+    fn on_device_event(&self, device_id: DeviceId, event: DeviceEvent) -> EventResult {
         match event {
             DeviceEvent::Key(key) => {
                 if let Some(scancode) = key.physical_key.to_scancode() {
@@ -722,6 +719,22 @@ impl CustomApplicationHandler for InputHandler {
             _ => {}
         }
         EventResult::Propagate
+    }
+}
+
+impl CustomApplicationHandler for InputHandler {
+    fn resumed(&mut self, _event_loop: &ActiveEventLoop) -> EventResult {
+        self.shared.resumed();
+        EventResult::Propagate
+    }
+
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        device_id: DeviceId,
+        event: DeviceEvent,
+    ) -> EventResult {
+        self.on_device_event(device_id, event)
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) -> EventResult {
@@ -807,25 +820,32 @@ static PTT_KEY: AtomicU32 = AtomicU32::new(u32::MAX);
 static PTT_OWNER: AtomicU64 = AtomicU64::new(0);
 static PTT_ENABLED: AtomicBool = AtomicBool::new(false);
 
+fn hook_event(code: i32, wparam: WPARAM, key: &KBDLLHOOKSTRUCT) {
+    if code != HC_ACTION as i32 {
+        return;
+    }
+    let extended = if key.flags & LLKHF_EXTENDED != 0 {
+        0xe000
+    } else {
+        0
+    };
+    if PTT_ENABLED.load(Ordering::Acquire)
+        && key.scanCode | extended == PTT_KEY.load(Ordering::Relaxed)
+    {
+        let owner = super::HoldOwner::from_id(PTT_OWNER.load(Ordering::Acquire));
+        match wparam as u32 {
+            WM_KEYDOWN | WM_SYSKEYDOWN => super::global_key(owner, true),
+            WM_KEYUP | WM_SYSKEYUP => super::global_key(owner, false),
+            _ => {}
+        }
+    }
+}
+
 unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code == HC_ACTION as i32 {
         // SAFETY: For HC_ACTION, lparam points at the keyboard hook's event.
         let key = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
-        let extended = if key.flags & LLKHF_EXTENDED != 0 {
-            0xe000
-        } else {
-            0
-        };
-        if PTT_ENABLED.load(Ordering::Acquire)
-            && key.scanCode | extended == PTT_KEY.load(Ordering::Relaxed)
-        {
-            let owner = super::HoldOwner::from_id(PTT_OWNER.load(Ordering::Acquire));
-            match wparam as u32 {
-                WM_KEYDOWN | WM_SYSKEYDOWN => super::global_hold(owner, true),
-                WM_KEYUP | WM_SYSKEYUP => super::global_hold(owner, false),
-                _ => {}
-            }
-        }
+        hook_event(code, wparam, key);
     }
     // SAFETY: Forward every key event so this hook never consumes input.
     unsafe { CallNextHookEx(ptr::null_mut(), code, wparam, lparam) }
@@ -845,6 +865,93 @@ mod tests {
         },
         WindowsAndMessaging::SendMessageW,
     };
+
+    struct RestorePtt {
+        enabled: bool,
+        key: u32,
+        owner: u64,
+        held: bool,
+        on: bool,
+        sources: crate::push_to_talk::HoldSources,
+    }
+
+    impl RestorePtt {
+        fn new() -> Self {
+            let sources = *crate::push_to_talk::HOLD_SOURCES
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Self {
+                enabled: PTT_ENABLED.load(Ordering::Acquire),
+                key: PTT_KEY.load(Ordering::Relaxed),
+                owner: PTT_OWNER.load(Ordering::Acquire),
+                held: yapfast_core::push_to_talk::held(),
+                on: yapfast_core::push_to_talk::on(),
+                sources,
+            }
+        }
+    }
+
+    impl Drop for RestorePtt {
+        fn drop(&mut self) {
+            PTT_ENABLED.store(false, Ordering::Release);
+            PTT_KEY.store(self.key, Ordering::Relaxed);
+            PTT_OWNER.store(self.owner, Ordering::Release);
+            let mut sources = crate::push_to_talk::HOLD_SOURCES
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *sources = self.sources;
+            yapfast_core::push_to_talk::hold(self.held);
+            yapfast_core::push_to_talk::set_release_delay(
+                yapfast_core::push_to_talk::DEFAULT_RELEASE_DELAY,
+            );
+            yapfast_core::push_to_talk::set_on(self.on);
+            PTT_ENABLED.store(self.enabled, Ordering::Release);
+        }
+    }
+
+    fn ptt_shared(scancode: u32) -> (Arc<Shared>, StatusReporter, u64) {
+        let bindings = Bindings {
+            talk: Some(super::super::Keybind {
+                scancode,
+                name: "V".into(),
+                trigger: None,
+            }),
+            ..Bindings::default()
+        };
+        let statuses = StatusReporter::new(&bindings, |_, _| {});
+        let owner = statuses.hold_owner();
+        let mut input = Input::new();
+        input.bindings = bindings;
+        input.statuses = Some(statuses.clone());
+        input.ptt_hook_installed = true;
+        (
+            Arc::new(Shared {
+                handler_installed: AtomicBool::new(true),
+                input: Mutex::new(input),
+            }),
+            statuses,
+            owner.id(),
+        )
+    }
+
+    fn hook_key(scancode: u32, down: bool) {
+        let key = KBDLLHOOKSTRUCT {
+            vkCode: 0,
+            scanCode: scancode,
+            flags: 0,
+            time: 0,
+            dwExtraInfo: 0,
+        };
+        let message = (if down { WM_KEYDOWN } else { WM_KEYUP }) as WPARAM;
+        hook_event(HC_ACTION as i32, message, &key);
+    }
+
+    fn remove_device(shared: &Arc<Shared>) {
+        let handler = InputHandler {
+            shared: shared.clone(),
+        };
+        handler.on_device_event(DeviceId::dummy(), DeviceEvent::Removed);
+    }
 
     #[test]
     fn a_remaining_input_sink_cannot_execute_without_session_notifications() {
@@ -877,6 +984,121 @@ mod tests {
         };
         shared.key(DeviceId::dummy(), 0x26, true);
         assert_eq!(count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn removed_device_releases_hook_ptt_until_a_valid_keyup() {
+        let _hold = crate::push_to_talk::HOLD_TEST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _restore = RestorePtt::new();
+        yapfast_core::push_to_talk::set_on(true);
+        yapfast_core::push_to_talk::set_release_delay(0);
+
+        let (shared, _statuses, owner) = ptt_shared(0x2f);
+        PTT_KEY.store(0x2f, Ordering::Relaxed);
+        PTT_OWNER.store(owner, Ordering::Release);
+        PTT_ENABLED.store(true, Ordering::Release);
+
+        hook_key(0x2f, true);
+        assert!(yapfast_core::push_to_talk::held());
+        assert!(yapfast_core::push_to_talk::sending());
+        remove_device(&shared);
+        super::super::global_hold(super::super::HoldOwner::from_id(owner), false);
+        assert!(!yapfast_core::push_to_talk::held());
+        assert!(!yapfast_core::push_to_talk::sending());
+
+        hook_key(0x2f, true);
+        assert!(
+            !yapfast_core::push_to_talk::held(),
+            "repeat revived removed hold"
+        );
+        assert!(!yapfast_core::push_to_talk::sending());
+
+        hook_key(0x2f, false);
+        hook_key(0x2f, true);
+        assert!(
+            yapfast_core::push_to_talk::held(),
+            "fresh press did not recover"
+        );
+        assert!(yapfast_core::push_to_talk::sending());
+        hook_key(0x2f, false);
+        assert!(!yapfast_core::push_to_talk::held());
+        assert!(!yapfast_core::push_to_talk::sending());
+
+        remove_device(&shared);
+        hook_key(0x2f, true);
+        assert!(
+            yapfast_core::push_to_talk::held(),
+            "removal while released swallowed the next press"
+        );
+        hook_key(0x2f, false);
+    }
+
+    #[test]
+    fn removing_a_device_preserves_the_focused_ptt_source() {
+        let _hold = crate::push_to_talk::HOLD_TEST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _restore = RestorePtt::new();
+        yapfast_core::push_to_talk::set_on(true);
+        yapfast_core::push_to_talk::set_release_delay(0);
+
+        let (shared, statuses, owner) = ptt_shared(0x2f);
+        statuses.set(
+            Binding::Talk,
+            Reach::Focused("global PTT is unavailable for this test"),
+        );
+        PTT_KEY.store(0x2f, Ordering::Relaxed);
+        PTT_OWNER.store(owner, Ordering::Release);
+        PTT_ENABLED.store(true, Ordering::Release);
+        super::super::focused_key_event(Some(0x2f), ElementState::Pressed, false);
+        hook_key(0x2f, true);
+        assert!(yapfast_core::push_to_talk::held());
+
+        remove_device(&shared);
+        assert!(
+            yapfast_core::push_to_talk::held(),
+            "removing a global device cleared the independent focused source"
+        );
+        hook_key(0x2f, true);
+        assert!(
+            !crate::push_to_talk::HOLD_SOURCES
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .global
+        );
+
+        hook_key(0x2f, false);
+        super::super::focused_key_event(Some(0x2f), ElementState::Released, false);
+        assert!(!yapfast_core::push_to_talk::held());
+        assert!(!yapfast_core::push_to_talk::sending());
+    }
+
+    #[test]
+    fn stale_device_removal_cannot_release_the_current_global_owner() {
+        let _hold = crate::push_to_talk::HOLD_TEST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _restore = RestorePtt::new();
+        yapfast_core::push_to_talk::set_on(true);
+        yapfast_core::push_to_talk::set_release_delay(0);
+
+        let (stale_shared, _stale_statuses, _stale_owner) = ptt_shared(0x2f);
+        let (_current_shared, _current_statuses, current_owner) = ptt_shared(0x2f);
+        PTT_KEY.store(0x2f, Ordering::Relaxed);
+        PTT_OWNER.store(current_owner, Ordering::Release);
+        PTT_ENABLED.store(true, Ordering::Release);
+
+        hook_key(0x2f, true);
+        assert!(yapfast_core::push_to_talk::held());
+        remove_device(&stale_shared);
+        assert!(yapfast_core::push_to_talk::held());
+        assert!(yapfast_core::push_to_talk::sending());
+
+        hook_key(0x2f, false);
+        assert!(!yapfast_core::push_to_talk::held());
+        assert!(!yapfast_core::push_to_talk::sending());
     }
 
     #[test]
